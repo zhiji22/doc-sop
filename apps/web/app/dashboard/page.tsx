@@ -8,6 +8,8 @@ import { FileList } from "@/components/files/FileList";
 import { RunHistory } from "@/components/runs/RunHistory";
 import { ResultRenderer } from "@/components/result/ResultRenderer";
 
+import Link from "next/link";
+
 export default function Dashboard() {
   const { getToken } = useAuth();
 
@@ -230,6 +232,10 @@ export default function Dashboard() {
           </div>
         ) : selectedRun.status === "failed" ? (
           <div style={{ color: "red" }}>Failed: {selectedRun.error}</div>
+        ) : selectedRun?.status === "done" ? (
+          <div style={{ marginBottom: 16 }}>
+            <Link href={`/runs/${selectedRun.id}`}>Open full detail page</Link>
+          </div>
         ) : (
           <ResultRenderer run={selectedRun} />
         )}
