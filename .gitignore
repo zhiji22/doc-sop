@@ -73,3 +73,12 @@ tmp/
 # =========================
 
 docker-data/
+
+# =========================
+# Next.js / Clerk extras
+# =========================
+
+.vercel/
+.clerk/
+*.pem
+*.tsbuildinfo

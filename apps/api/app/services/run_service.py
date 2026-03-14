@@ -1,3 +1,7 @@
+"""
+生成任务（Run）核心业务逻辑
+这是整个系统最关键的模块，串联了：文件下载 → 文档解析 → LLM 生成 → 结果持久化。
+"""
 import json
 import uuid
 from fastapi import HTTPException
@@ -10,9 +14,22 @@ from app.services.llm_service import generate_structured_output
 
 
 def create_run_for_user(user_id: str, file_id: str, template: str):
+    """
+    创建并执行一次生成任务（同步）。
+    完整流程：
+      1. 校验模板类型
+      2. 查询文件记录，确认文件属于当前用户
+      3. 在 runs 表中创建一条 status='running' 的记录
+      4. 从 MinIO 下载文件 → 解析为纯文本 → 截断 → 送入 LLM
+      5. 成功 → 更新 runs 状态为 'done'，保存结果
+      6. 失败 → 更新 runs 状态为 'failed'，记录错误信息
+    """
+
+    # ── 第 1 步：校验模板 ──
     if template not in {"sop", "checklist", "summary"}:
         raise HTTPException(status_code=400, detail="template must be one of: sop, checklist, summary")
 
+    # ── 第 2 步：查询文件记录（同时校验归属权） ──
     with engine.begin() as conn:
         file_row = conn.execute(
             text(
@@ -28,6 +45,7 @@ def create_run_for_user(user_id: str, file_id: str, template: str):
     if not file_row:
         raise HTTPException(status_code=404, detail="File not found")
 
+    # ── 第 3 步：创建 run 记录，初始状态为 running ──
     run_id = str(uuid.uuid4())
 
     with engine.begin() as conn:
@@ -47,6 +65,7 @@ def create_run_for_user(user_id: str, file_id: str, template: str):
         )
 
     try:
+        # ── 第 4 步：下载文件 → 解析 → 截断 ──
         file_bytes = download_file_bytes(file_row["storage_key"])
         raw_text = parse_document(
             filename=file_row["filename"],
@@ -57,11 +76,16 @@ def create_run_for_user(user_id: str, file_id: str, template: str):
         if not raw_text:
             raise HTTPException(status_code=400, detail="Document text is empty after parsing")
 
+        # 截断到 12000 字符，防止超出 LLM 上下文限制
         prompt_text = truncate_text(raw_text, max_chars=12000)
+
+        # ── 第 5 步：调用 LLM 生成结构化结果 ──
         result_json, usage_tokens = generate_structured_output(prompt_text, template)
 
+        # 简单估算费用：每 1000 token 按 $0.001 计算
         cost_usd = round((usage_tokens / 1000) * 0.001, 6)
 
+        # ── 第 6 步：成功，更新 run 状态为 done ──
         with engine.begin() as conn:
             conn.execute(
                 text(
@@ -95,7 +119,9 @@ def create_run_for_user(user_id: str, file_id: str, template: str):
             "cost_usd": cost_usd,
         }
 
+    # ── 异常处理：将 run 标记为 failed 并记录错误 ──
     except HTTPException as e:
+        # 业务异常（如文档为空），保留原始状态码
         with engine.begin() as conn:
             conn.execute(
                 text(
@@ -115,6 +141,7 @@ def create_run_for_user(user_id: str, file_id: str, template: str):
         raise e
 
     except Exception as e:
+        # 未预期的异常（如 LLM 超时），统一返回 500
         with engine.begin() as conn:
             conn.execute(
                 text(
@@ -135,6 +162,7 @@ def create_run_for_user(user_id: str, file_id: str, template: str):
 
 
 def get_run_for_user(user_id: str, run_id: str):
+    """查询某次 run 的详情，仅返回属于当前用户的记录"""
     with engine.begin() as conn:
         row = conn.execute(
             text(
