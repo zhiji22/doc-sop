@@ -1,168 +1,247 @@
-/**
- * Dashboard 页面（/dashboard）
- * 核心交互页面，提供两个主要功能：
- *   1. 上传文件（PDF/DOCX）→ 通过预签名 URL 直传 MinIO
- *   2. 选择模板生成结构化输出 → 调用后端 LLM 服务
- *
- * 此页面受 middleware.ts 保护，必须登录后才能访问。
- */
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
-
-/** 上传成功后保存的文件信息 */
-type UploadedFileInfo = {
-  file_id: string;
-  storage_key: string;
-  filename: string;
-};
-
+import { fetchFiles, fetchRunById, fetchRuns, authedFetch } from "@/lib/api";
+import type { FileItem, RunItem } from "@/types";
+import { FileList } from "@/components/files/FileList";
+import { RunHistory } from "@/components/runs/RunHistory";
+import { ResultRenderer } from "@/components/result/ResultRenderer";
 
 export default function Dashboard() {
-  // 从 Clerk 获取 getToken 方法，用于请求后端 API 时附带 JWT
   const { getToken } = useAuth();
 
-  const [log, setLog] = useState<string>("");           // 操作日志，显示当前步骤
-  const [uploadedFile, setUploadedFile] = useState<UploadedFileInfo | null>(null);  // 已上传的文件信息
-  const [result, setResult] = useState<any>(null);       // LLM 生成的结构化结果
+  const [log, setLog] = useState("");
+  const [files, setFiles] = useState<FileItem[]>([]);
+  const [runs, setRuns] = useState<RunItem[]>([]);
+  const [selectedFile, setSelectedFile] = useState<FileItem | null>(null);
+  const [selectedRun, setSelectedRun] = useState<RunItem | null>(null);
 
-  /**
-   * 文件上传流程（三步）：
-   *   1. 调用后端 /v1/files/presign → 获取预签名 URL
-   *   2. 用预签名 URL 将文件 PUT 到 MinIO（浏览器直传，不经过后端）
-   *   3. 保存文件信息，等待用户选择模板生成
-   */
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+
+  function stopPolling() {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+  }
+
+  async function refreshFilesAndRuns() {
+    const [fileData, runData] = await Promise.all([
+      fetchFiles(getToken, 30),
+      fetchRuns(getToken, 30),
+    ]);
+    setFiles(fileData);
+    setRuns(runData);
+  }
+
   async function upload(file: File) {
-    setResult(null);
+    setLog("1) presigning upload...");
 
-    // 步骤 1：获取 Clerk JWT token
-    setLog("1) getting token...");
-    const token = await getToken();
-
-    // 步骤 2：请求后端生成预签名上传 URL
-    setLog("2) presigning...");
-    const presignRes = await fetch(`${process.env.NEXT_PUBLIC_API_BASE}/v1/files/presign`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,   // 携带 JWT 认证
-      },
-      body: JSON.stringify({
-        filename: file.name,
-        mime: file.type || "application/octet-stream",
-        size: file.size,
-      }),
-    });
+    const presignRes = await authedFetch(
+      getToken,
+      `${process.env.NEXT_PUBLIC_API_BASE}/v1/files/presign`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          filename: file.name,
+          mime: file.type || "application/octet-stream",
+          size: file.size,
+        }),
+      }
+    );
 
     if (!presignRes.ok) {
-      const t = await presignRes.text();
-      throw new Error(`presign failed: ${t}`);
+      throw new Error(`presign failed: ${await presignRes.text()}`);
     }
 
-    const { upload_url, file_id, storage_key } = await presignRes.json();
+    const { upload_url } = await presignRes.json();
 
-    // 步骤 3：用预签名 URL 直接 PUT 文件到 MinIO
-    setLog(`3) uploading file to S3-compatible storage... file_id=${file_id}`);
+    setLog("2) uploading file...");
 
     const putRes = await fetch(upload_url, {
       method: "PUT",
       headers: {
         "Content-Type": file.type || "application/octet-stream",
       },
-      body: file,   // 文件二进制直传
+      body: file,
     });
 
     if (!putRes.ok) {
       throw new Error(`upload failed: ${putRes.status}`);
     }
 
-    // 上传成功，保存文件信息供后续生成使用
-    setUploadedFile({
-      file_id,
-      storage_key,
-      filename: file.name,
-    });
+    // 刷新文件列表，并自动选中刚上传的文件（列表按时间倒序，第一条就是最新的）
+    const fileData = await fetchFiles(getToken, 30);
+    setFiles(fileData);
 
-    setLog(`uploaded: ${file.name}`);
+    const newest = fileData[0];
+    if (newest) {
+      setSelectedFile(newest);
+    }
+
+    await fetchRuns(getToken, 30).then(setRuns);
+    setLog(`✅ uploaded: ${file.name}`);
   }
 
-  /**
-   * 创建生成任务：
-   * 调用后端 /v1/runs，传入 file_id 和模板类型，
-   * 后端同步执行：下载文件 → 解析文档 → LLM 生成 → 返回结果。
-   */
   async function createRun(template: "sop" | "checklist" | "summary") {
-    if (!uploadedFile) {
-      alert("Please upload a file first.");
+    if (!selectedFile) {
+      alert("Please select a file first.");
       return;
     }
 
-    setLog(`4) creating run (${template})...`);
-    const token = await getToken();
+    stopPolling();
+    setSelectedRun(null);
+    setLog(`Creating ${template} run...`);
 
-    const runRes = await fetch(`${process.env.NEXT_PUBLIC_API_BASE}/v1/runs`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        file_id: uploadedFile.file_id,
-        template,
-      }),
-    });
+    const res = await authedFetch(
+      getToken,
+      `${process.env.NEXT_PUBLIC_API_BASE}/v1/runs`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          file_id: selectedFile.id,
+          template,
+        }),
+      }
+    );
 
-    const data = await runRes.json();
+    const data = await res.json();
 
-    if (!runRes.ok) {
+    if (!res.ok) {
       throw new Error(data.detail || "create run failed");
     }
 
-    setResult(data);
-    setLog(`run completed: ${data.id}`);
+    setSelectedRun(data);
+    setLog(`⏳ run queued: ${data.id}`);
+    await refreshFilesAndRuns();
+
+    pollingRef.current = setInterval(async () => {
+      try {
+        const latest = await fetchRunById(getToken, data.id);
+        setSelectedRun(latest);
+
+        if (latest.status === "done" || latest.status === "failed") {
+          stopPolling();
+          await refreshFilesAndRuns();
+          setLog(
+            latest.status === "done"
+              ? "✅ run completed"
+              : `❌ run failed: ${latest.error}`
+          );
+        } else {
+          setLog(`⏳ run status: ${latest.status}`);
+        }
+      } catch (err) {
+        stopPolling();
+        setLog(`polling failed: ${String(err)}`);
+      }
+    }, 1000);
   }
 
+  useEffect(() => {
+    refreshFilesAndRuns().catch((err) =>
+      setLog(`Failed to load dashboard data: ${String(err)}`)
+    );
+
+    return () => stopPolling();
+  }, []);
+
+  const filteredRuns = selectedFile
+    ? runs.filter((run) => run.file_id === selectedFile.id)
+    : runs;
+
   return (
-    <div style={{ padding: 24 }}>
-      <h2>Dashboard</h2>
+    <div
+      style={{
+        padding: 24,
+        display: "grid",
+        gridTemplateColumns: "280px 320px 1fr",
+        gap: 16,
+        alignItems: "start",
+      }}
+    >
+      <aside style={panelStyle}>
+        <h3 style={{ marginTop: 0 }}>Files</h3>
 
-      {/* 文件选择器：仅接受 PDF 和 DOCX */}
-      <input
-        type="file"
-        accept=".pdf,.docx"
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) {
-            upload(f).catch((err) => setLog(String(err)));
-          }
-        }}
-      />
+        <input
+          type="file"
+          accept=".pdf,.docx"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) {
+              upload(f).catch((err) => setLog(String(err)));
+            }
+          }}
+        />
 
-      {/* 上传成功后显示模板选择按钮 */}
-      {uploadedFile && (
         <div style={{ marginTop: 16 }}>
-          <div>Uploaded: {uploadedFile.filename}</div>
-          <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
-            <button onClick={() => createRun("sop")}>Generate SOP</button>
-            <button onClick={() => createRun("checklist")}>Generate Checklist</button>
-            <button onClick={() => createRun("summary")}>Generate Summary</button>
+          <FileList
+            files={files}
+            selectedFileId={selectedFile?.id ?? null}
+            onSelect={(file) => setSelectedFile(file)}
+          />
+        </div>
+      </aside>
+
+      <aside style={panelStyle}>
+        <h3 style={{ marginTop: 0 }}>Runs</h3>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+          <button onClick={() => createRun("sop")} disabled={!selectedFile}>
+            Generate SOP
+          </button>
+          <button onClick={() => createRun("checklist")} disabled={!selectedFile}>
+            Checklist
+          </button>
+          <button onClick={() => createRun("summary")} disabled={!selectedFile}>
+            Summary
+          </button>
+        </div>
+
+        <div style={{ marginBottom: 12, fontSize: 13, color: "#666" }}>
+          {selectedFile ? `Selected file: ${selectedFile.filename}` : "No file selected"}
+        </div>
+
+        <RunHistory
+          runs={filteredRuns}
+          selectedRunId={selectedRun?.id ?? null}
+          onSelect={(run) => setSelectedRun(run)}
+        />
+      </aside>
+
+      <main style={panelStyle}>
+        <h3 style={{ marginTop: 0 }}>Result</h3>
+
+        <div style={{ marginBottom: 16, fontSize: 13, color: "#666" }}>{log}</div>
+
+        {!selectedRun ? (
+          <div>Select a run to view its result.</div>
+        ) : selectedRun.status === "queued" || selectedRun.status === "running" ? (
+          <div>
+            <div style={{ fontWeight: 600 }}>Processing...</div>
+            <div style={{ marginTop: 8 }}>Current status: {selectedRun.status}</div>
           </div>
-        </div>
-      )}
-
-      {/* 操作日志 */}
-      <pre style={{ marginTop: 16, whiteSpace: "pre-wrap" }}>{log}</pre>
-
-      {/* LLM 生成结果展示 */}
-      {result && (
-        <div style={{ marginTop: 24 }}>
-          <h3>Run Result</h3>
-          <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto" }}>
-            {JSON.stringify(result, null, 2)}
-          </pre>
-        </div>
-      )}
+        ) : selectedRun.status === "failed" ? (
+          <div style={{ color: "red" }}>Failed: {selectedRun.error}</div>
+        ) : (
+          <ResultRenderer run={selectedRun} />
+        )}
+      </main>
     </div>
   );
 }
+
+const panelStyle: React.CSSProperties = {
+  border: "1px solid #ddd",
+  borderRadius: 12,
+  padding: 16,
+  background: "#fafafa",
+  minHeight: "80vh",
+};

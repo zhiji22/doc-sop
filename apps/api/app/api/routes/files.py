@@ -3,12 +3,13 @@
 实现「预签名上传」机制：后端不直接接收文件，而是生成一个临时 URL，前端直传 MinIO。
 """
 import uuid
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 
 from app.api.deps import get_current_user
 from app.db.database import engine
-from app.schemas.file import PresignIn, PresignOut
+from app.schemas.file import FileOut, PresignIn, PresignOut
+from app.services.file_service import list_files_for_user
 from app.services.storage_service import generate_upload_url
 
 router = APIRouter(prefix="/v1/files", tags=["files"])
@@ -55,3 +56,13 @@ def presign_upload(body: PresignIn, user=Depends(get_current_user)):
     )
 
     return PresignOut(file_id=file_id, storage_key=storage_key, upload_url=upload_url)
+
+@router.get("", response_model=list[FileOut])
+def list_files(
+    limit: int = Query(default=20, ge=1, le=100),
+    user=Depends(get_current_user),
+):
+    return list_files_for_user(
+        user_id=user["user_id"],
+        limit=limit,
+    )
