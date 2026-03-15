@@ -9,6 +9,8 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 - db：数据库连接
 - core：配置、鉴权
 
+进入postgres命令行：docker exec -it doc-sop-postgres psql -U postgres -d postgres
+
 First, run the development server:
 
 ```bash

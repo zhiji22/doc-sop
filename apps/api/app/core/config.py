@@ -28,7 +28,8 @@ class Settings:
     LLM_API_KEY: str = os.environ["LLM_API_KEY"]
     LLM_BASE_URL: str = os.environ["LLM_BASE_URL"]  # 兼容 OpenAI 格式的 API 地址（可对接阿里 Dashscope 等）
     LLM_MODEL: str = os.environ["LLM_MODEL"]  # 模型名称，如 qwen-plus
-
+    EMBEDDING_MODEL: str = os.environ["EMBEDDING_MODEL"]
+    
     PUBLIC_WEB_BASE_URL: str = os.getenv("PUBLIC_WEB_BASE_URL", "http://localhost:3000")
 
 # 全局单例，其他模块通过 from app.core.config import settings 使用

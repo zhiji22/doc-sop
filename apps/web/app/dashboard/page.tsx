@@ -7,6 +7,7 @@ import type { FileItem, RunItem } from "@/types";
 import { FileList } from "@/components/files/FileList";
 import { RunHistory } from "@/components/runs/RunHistory";
 import { ResultRenderer } from "@/components/result/ResultRenderer";
+import { FileQaPanel } from "@/components/qa/FileQaPanel";
 
 import Link from "next/link";
 
@@ -164,7 +165,7 @@ export default function Dashboard() {
       style={{
         padding: 24,
         display: "grid",
-        gridTemplateColumns: "280px 320px 1fr",
+        gridTemplateColumns: "260px 300px 1fr",
         gap: 16,
         alignItems: "start",
       }}
@@ -218,27 +219,29 @@ export default function Dashboard() {
         />
       </aside>
 
-      <main style={panelStyle}>
-        <h3 style={{ marginTop: 0 }}>Result</h3>
+      <main style={{ display: "grid", gap: 16 }}>
+        <section style={panelStyle}>
+          <h3 style={{ marginTop: 0 }}>Result</h3>
 
-        <div style={{ marginBottom: 16, fontSize: 13, color: "#666" }}>{log}</div>
+          <div style={{ marginBottom: 16, fontSize: 13, color: "#666" }}>{log}</div>
 
-        {!selectedRun ? (
-          <div>Select a run to view its result.</div>
-        ) : selectedRun.status === "queued" || selectedRun.status === "running" ? (
-          <div>
-            <div style={{ fontWeight: 600 }}>Processing...</div>
-            <div style={{ marginTop: 8 }}>Current status: {selectedRun.status}</div>
-          </div>
-        ) : selectedRun.status === "failed" ? (
-          <div style={{ color: "red" }}>Failed: {selectedRun.error}</div>
-        ) : selectedRun?.status === "done" ? (
-          <div style={{ marginBottom: 16 }}>
-            <Link href={`/runs/${selectedRun.id}`}>Open full detail page</Link>
-          </div>
-        ) : (
-          <ResultRenderer run={selectedRun} />
-        )}
+          {!selectedRun ? (
+            <div>Select a run to view its result.</div>
+          ) : selectedRun.status === "queued" || selectedRun.status === "running" ? (
+            <div>
+              <div style={{ fontWeight: 600 }}>Processing...</div>
+              <div style={{ marginTop: 8 }}>Current status: {selectedRun.status}</div>
+            </div>
+          ) : selectedRun.status === "failed" ? (
+            <div style={{ color: "red" }}>Failed: {selectedRun.error}</div>
+          ) : (
+            <ResultRenderer run={selectedRun} />
+          )}
+        </section>
+
+        <section style={panelStyle}>
+          <FileQaPanel file={selectedFile} />
+        </section>
       </main>
     </div>
   );

@@ -59,11 +59,32 @@ export type ShareRunResponse = {
     is_public: boolean;
 };
   
-  export type PublicRun = {
+export type PublicRun = {
     id: string;
     template: "sop" | "checklist" | "summary";
     status: "queued" | "running" | "done" | "failed";
     result_json: any | null;
     error: string | null;
     share_id?: string | null;
+};
+
+export type CitationItem = {
+    chunk_id: string;
+    chunk_index: number;
+    snippet: string;
+};
+  
+export type QaAskResponse = {
+    answer: string;
+    citations: CitationItem[];
+};
+
+export type QaMessage = {
+    id: string;
+    file_id: string;
+    user_id: string;
+    role: "user" | "assistant";
+    content: string;
+    citations?: CitationItem[];
+    created_at?: string | null;
 };

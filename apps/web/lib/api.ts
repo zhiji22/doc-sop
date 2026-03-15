@@ -1,4 +1,4 @@
-import type { FileItem, RunItem, ShareRunResponse, PublicRun } from "@/types";
+import type { FileItem, RunItem, ShareRunResponse, PublicRun, QaAskResponse, QaMessage } from "@/types";
 
 export async function authedFetch(
   getToken: () => Promise<string | null>,
@@ -105,6 +105,50 @@ export async function unshareRun(
     {
       method: "POST",
     }
+  );
+
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+
+  return res.json();
+}
+
+export async function askFileQuestion(
+  getToken: () => Promise<string | null>,
+  fileId: string,
+  question: string
+): Promise<QaAskResponse> {
+  const res = await authedFetch(
+    getToken,
+    `${process.env.NEXT_PUBLIC_API_BASE}/v1/qa/ask`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        file_id: fileId,
+        question,
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+
+  return res.json();
+}
+
+export async function fetchQaMessages(
+  getToken: () => Promise<string | null>,
+  fileId: string,
+  limit = 50
+): Promise<QaMessage[]> {
+  const res = await authedFetch(
+    getToken,
+    `${process.env.NEXT_PUBLIC_API_BASE}/v1/qa/messages/${fileId}?limit=${limit}`
   );
 
   if (!res.ok) {

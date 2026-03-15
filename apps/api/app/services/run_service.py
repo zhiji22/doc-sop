@@ -1,6 +1,7 @@
 import json
 import uuid
 import secrets
+import math
 from fastapi import HTTPException
 from sqlalchemy import text
 
@@ -9,6 +10,8 @@ from app.services.storage_service import download_file_bytes
 from app.services.document_service import parse_document, truncate_text
 from app.services.llm_service import generate_structured_output
 from app.core.config import settings
+
+from app.services.rag_service import index_file_chunks
 
 
 VALID_TEMPLATES = {"sop", "checklist", "summary"}
@@ -102,6 +105,12 @@ def process_run(run_id: str, user_id: str):
 
         if not raw_text:
             raise HTTPException(status_code=400, detail="Document text is empty after parsing")
+
+        index_file_chunks(
+            user_id=user_id,
+            file_id=str(run_row["file_id"]),
+            raw_text=raw_text,
+        )
 
         # 4. 截断
         prompt_text = truncate_text(raw_text, max_chars=12000)

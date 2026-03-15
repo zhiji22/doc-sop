@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api.routes.files import router as files_router
 from app.api.routes.runs import router as runs_router
+from app.api.routes.qa import router as qa_router
 from app.services.storage_service import get_s3_client
 
 
@@ -50,3 +51,4 @@ def health():
 # 挂载业务路由
 app.include_router(files_router)   # /v1/files/*  文件上传相关
 app.include_router(runs_router)    # /v1/runs/*   生成任务相关
+app.include_router(qa_router)      # /v1/qa/*    问答相关
