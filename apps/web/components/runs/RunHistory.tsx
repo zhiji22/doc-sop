@@ -45,7 +45,7 @@ export function RunHistory({
               <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
                 Status: {run.status}
               </div>
-              <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+              <div style={{ fontSize: 12, color: run.is_public ? "green" : "#666", marginTop: 4 }}>
                 Share: {run.is_public ? "Public" : "Private"}
               </div>
               <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>

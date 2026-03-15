@@ -94,3 +94,22 @@ export async function fetchPublicRun(shareId: string): Promise<PublicRun> {
   
     return res.json();
 }
+
+export async function unshareRun(
+  getToken: () => Promise<string | null>,
+  runId: string
+): Promise<ShareRunResponse> {
+  const res = await authedFetch(
+    getToken,
+    `${process.env.NEXT_PUBLIC_API_BASE}/v1/runs/${runId}/unshare`,
+    {
+      method: "POST",
+    }
+  );
+
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+
+  return res.json();
+}

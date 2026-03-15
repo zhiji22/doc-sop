@@ -5,7 +5,7 @@ import { useAuth } from "@clerk/nextjs";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 
-import { fetchRunById, shareRun } from "@/lib/api";
+import { fetchRunById, shareRun, unshareRun } from "@/lib/api";
 import type { RunItem } from "@/types";
 import { ResultRenderer } from "@/components/result/ResultRenderer";
 
@@ -42,6 +42,14 @@ export default function RunDetailPage() {
         }
     }, [runId, getToken]);
 
+    useEffect(() => {
+        if (run?.is_public && run.share_id) {
+          setShareUrl(`${process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"}/share/${run.share_id}`);
+        } else {
+          setShareUrl("");
+        }
+      }, [run]);
+
     return (
         <div style={{ padding: 24, maxWidth: 1100, margin: "0 auto" }}>
             <div style={{ marginBottom: 16 }}>
@@ -72,64 +80,115 @@ export default function RunDetailPage() {
                         {run.status === "done" && (
                             <div style={{ marginTop: 16, display: "flex", gap: 8, flexWrap: "wrap" }}>
                                 <button
-                                    onClick={() => {
-                                        const md = runToMarkdown(run);
-                                        downloadTextFile(`${run.template}-${run.id}.md`, md, "text/markdown;charset=utf-8");
-                                    }}
+                                onClick={() => {
+                                    const md = runToMarkdown(run);
+                                    downloadTextFile(`${run.template}-${run.id}.md`, md, "text/markdown;charset=utf-8");
+                                }}
                                 >
-                                    Export Markdown
+                                Export Markdown
                                 </button>
 
                                 <button onClick={() => window.print()}>
-                                    Export PDF
+                                Export PDF
                                 </button>
 
+                                {!run.is_public ? (
                                 <button
                                     onClick={async () => {
-                                        try {
-                                            setShareLoading(true);
-                                            const data = await shareRun(getToken, run.id);
-                                            setShareUrl(data.share_url);
-                                        } catch (err) {
-                                            setError(String(err));
-                                        } finally {
-                                            setShareLoading(false);
-                                        }
+                                    try {
+                                        setShareLoading(true);
+                                        const data = await shareRun(getToken, run.id);
+                                        setShareUrl(data.share_url);
+                                        setRun((prev) =>
+                                        prev
+                                            ? {
+                                                ...prev,
+                                                is_public: true,
+                                                share_id: data.share_id,
+                                            }
+                                            : prev
+                                        );
+                                    } catch (err) {
+                                        setError(String(err));
+                                    } finally {
+                                        setShareLoading(false);
+                                    }
                                     }}
                                 >
                                     {shareLoading ? "Sharing..." : "Create Share Link"}
                                 </button>
-                            </div>
-                        )}
-                        {shareUrl && (
-                            <div style={{ marginTop: 16 }}>
-                                <div style={{ fontWeight: 600, marginBottom: 8 }}>Share Link</div>
-                                <div
-                                    style={{
-                                        border: "1px solid #ddd",
-                                        borderRadius: 8,
-                                        padding: 12,
-                                        background: "#fafafa",
-                                        wordBreak: "break-all",
+                                ) : (
+                                <button
+                                    onClick={async () => {
+                                    try {
+                                        setShareLoading(true);
+                                        await unshareRun(getToken, run.id);
+                                        setShareUrl("");
+                                        setRun((prev) =>
+                                        prev
+                                            ? {
+                                                ...prev,
+                                                is_public: false,
+                                            }
+                                            : prev
+                                        );
+                                    } catch (err) {
+                                        setError(String(err));
+                                    } finally {
+                                        setShareLoading(false);
+                                    }
                                     }}
                                 >
-                                    {shareUrl}
+                                    {shareLoading ? "Updating..." : "Disable Share"}
+                                </button>
+                                )}
+                            </div>
+                            )}
+                        {run?.status === "done" && (
+                        <div style={{ marginTop: 16 }}>
+                            <div style={{ fontWeight: 600, marginBottom: 8 }}>Share Status</div>
+                            <div
+                            style={{
+                                border: "1px solid #ddd",
+                                borderRadius: 8,
+                                padding: 12,
+                                background: "#fafafa",
+                            }}
+                            >
+                            {run.is_public ? "Public" : "Private"}
+                            </div>
+
+                            {run.is_public && shareUrl && (
+                            <>
+                                <div
+                                style={{
+                                    marginTop: 12,
+                                    border: "1px solid #ddd",
+                                    borderRadius: 8,
+                                    padding: 12,
+                                    background: "#fff",
+                                    wordBreak: "break-all",
+                                }}
+                                >
+                                {shareUrl}
                                 </div>
 
                                 <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
-                                    <button
-                                        onClick={async () => {
-                                            await navigator.clipboard.writeText(shareUrl);
-                                        }}
-                                    >
-                                        Copy Link
-                                    </button>
+                                <button
+                                    onClick={async () => {
+                                    await navigator.clipboard.writeText(shareUrl);
+                                    }}
+                                >
+                                    Copy Link
+                                </button>
 
-                                    <a href={shareUrl} target="_blank" rel="noreferrer">
-                                        Open Share Page
-                                    </a>
+                                <a href={shareUrl} target="_blank" rel="noreferrer">
+                                    Open Share Page
+                                </a>
                                 </div>
-                            </div>
+                            </>
+                            )}
+                        </div>
                         )}
                     </section>
 

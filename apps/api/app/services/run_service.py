@@ -57,6 +57,8 @@ def create_run_record(user_id: str, file_id: str, template: str):
         "error": None,
         "usage_tokens": None,
         "cost_usd": None,
+        "share_id": None,
+        "is_public": False,
     }
 
 
@@ -231,7 +233,7 @@ def create_or_enable_share_for_run(user_id: str, run_id: str):
     with engine.begin() as conn:
         row = conn.execute(
             text("""
-                select id, share_id, is_public
+                select id, status, share_id, is_public
                 from public.runs
                 where id = :run_id and user_id = :user_id
             """),
@@ -240,6 +242,9 @@ def create_or_enable_share_for_run(user_id: str, run_id: str):
 
         if not row:
             raise HTTPException(status_code=404, detail="Run not found")
+
+        if row["status"] != "done":
+            raise HTTPException(status_code=400, detail="Only completed runs can be shared")
 
         share_id = row["share_id"]
         if not share_id:
@@ -263,6 +268,38 @@ def create_or_enable_share_for_run(user_id: str, run_id: str):
         "share_id": share_id,
         "share_url": f"{settings.PUBLIC_WEB_BASE_URL}/share/{share_id}",
         "is_public": True,
+    }
+
+def disable_share_for_run(user_id: str, run_id: str):
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("""
+                select id, share_id, is_public
+                from public.runs
+                where id = :run_id and user_id = :user_id
+            """),
+            {"run_id": run_id, "user_id": user_id},
+        ).mappings().first()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        conn.execute(
+            text("""
+                update public.runs
+                set is_public = false
+                where id = :run_id and user_id = :user_id
+            """),
+            {
+                "run_id": run_id,
+                "user_id": user_id,
+            },
+        )
+
+    return {
+        "share_id": row["share_id"],
+        "share_url": f"{settings.PUBLIC_WEB_BASE_URL}/share/{row['share_id']}" if row["share_id"] else "",
+        "is_public": False,
     }
 
 

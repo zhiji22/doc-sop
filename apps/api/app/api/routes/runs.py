@@ -9,6 +9,7 @@ from app.services.run_service import (
     get_run_for_user,
     list_runs_for_user,
     create_or_enable_share_for_run,
+    disable_share_for_run,
     get_public_run_by_share_id,
 )
 
@@ -65,3 +66,10 @@ def share_run(run_id: str, user=Depends(get_current_user)):
 @router.get("/public/{share_id}", response_model=PublicRunOut)
 def get_public_run(share_id: str):
     return get_public_run_by_share_id(share_id)
+
+@router.post("/{run_id}/unshare", response_model=ShareRunOut)
+def unshare_run(run_id: str, user=Depends(get_current_user)):
+    return disable_share_for_run(
+        user_id=user["user_id"],
+        run_id=run_id,
+    )
