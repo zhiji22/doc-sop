@@ -1,5 +1,6 @@
 import json
 import uuid
+import secrets
 from fastapi import HTTPException
 from sqlalchemy import text
 
@@ -7,6 +8,7 @@ from app.db.database import engine
 from app.services.storage_service import download_file_bytes
 from app.services.document_service import parse_document, truncate_text
 from app.services.llm_service import generate_structured_output
+from app.core.config import settings
 
 
 VALID_TEMPLATES = {"sop", "checklist", "summary"}
@@ -169,7 +171,7 @@ def get_run_for_user(user_id: str, run_id: str):
     with engine.begin() as conn:
         row = conn.execute(
             text("""
-                select id, user_id, file_id, template, status, result_json, error, usage_tokens, cost_usd, created_at
+                select id, user_id, file_id, template, status, result_json, error, usage_tokens, cost_usd, created_at, share_id, is_public
                 from public.runs
                 where id = :run_id and user_id = :user_id
             """),
@@ -189,6 +191,8 @@ def get_run_for_user(user_id: str, run_id: str):
         "error": row["error"],
         "usage_tokens": row["usage_tokens"],
         "cost_usd": float(row["cost_usd"]) if row["cost_usd"] is not None else None,
+        "share_id": row["share_id"],
+        "is_public": bool(row["is_public"]),
     }
 
 
@@ -196,7 +200,7 @@ def list_runs_for_user(user_id: str, limit: int = 20):
     with engine.begin() as conn:
         rows = conn.execute(
             text("""
-                select id, user_id, file_id, template, status, result_json, error, usage_tokens, cost_usd, created_at
+                select id, user_id, file_id, template, status, result_json, error, usage_tokens, cost_usd, created_at, share_id, is_public
                 from public.runs
                 where user_id = :user_id
                 order by created_at desc
@@ -217,5 +221,70 @@ def list_runs_for_user(user_id: str, limit: int = 20):
             "error": row["error"],
             "usage_tokens": row["usage_tokens"],
             "cost_usd": float(row["cost_usd"]) if row["cost_usd"] is not None else None,
+            "share_id": row["share_id"],
+            "is_public": bool(row["is_public"]),
         })
     return result
+
+
+def create_or_enable_share_for_run(user_id: str, run_id: str):
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("""
+                select id, share_id, is_public
+                from public.runs
+                where id = :run_id and user_id = :user_id
+            """),
+            {"run_id": run_id, "user_id": user_id},
+        ).mappings().first()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        share_id = row["share_id"]
+        if not share_id:
+            share_id = secrets.token_urlsafe(8)
+
+        conn.execute(
+            text("""
+                update public.runs
+                set share_id = :share_id,
+                    is_public = true
+                where id = :run_id and user_id = :user_id
+            """),
+            {
+                "share_id": share_id,
+                "run_id": run_id,
+                "user_id": user_id,
+            },
+        )
+
+    return {
+        "share_id": share_id,
+        "share_url": f"{settings.PUBLIC_WEB_BASE_URL}/share/{share_id}",
+        "is_public": True,
+    }
+
+
+def get_public_run_by_share_id(share_id: str):
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("""
+                select id, template, status, result_json, error, share_id, is_public
+                from public.runs
+                where share_id = :share_id and is_public = true
+            """),
+            {"share_id": share_id},
+        ).mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Shared run not found")
+
+    return {
+        "id": str(row["id"]),
+        "template": row["template"],
+        "status": row["status"],
+        "result_json": row["result_json"],
+        "error": row["error"],
+        "share_id": row["share_id"],
+    }

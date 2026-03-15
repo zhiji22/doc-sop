@@ -46,6 +46,9 @@ export function RunHistory({
                 Status: {run.status}
               </div>
               <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+                Share: {run.is_public ? "Public" : "Private"}
+              </div>
+              <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
                 Tokens: {run.usage_tokens ?? "-"} · Cost: {run.cost_usd ?? "-"}
               </div>
               {run.error && (

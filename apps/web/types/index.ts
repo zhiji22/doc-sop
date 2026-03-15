@@ -19,6 +19,8 @@ export type RunItem = {
     error: string | null;
     usage_tokens: number | null;
     cost_usd: number | null;
+    share_id?: string | null;
+    is_public?: boolean;
 };
 
 export type SopResult = {
@@ -49,4 +51,19 @@ export type SummaryResult = {
     key_points: string[];
     risks: string[];
     open_questions: string[];
+};
+
+export type ShareRunResponse = {
+    share_id: string;
+    share_url: string;
+    is_public: boolean;
+};
+  
+  export type PublicRun = {
+    id: string;
+    template: "sop" | "checklist" | "summary";
+    status: "queued" | "running" | "done" | "failed";
+    result_json: any | null;
+    error: string | null;
+    share_id?: string | null;
 };

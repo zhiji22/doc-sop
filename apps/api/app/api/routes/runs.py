@@ -2,12 +2,14 @@
 from fastapi import APIRouter, Depends, BackgroundTasks, Query
 
 from app.api.deps import get_current_user
-from app.schemas.run import CreateRunIn, RunOut
+from app.schemas.run import CreateRunIn, RunOut, ShareRunOut, PublicRunOut
 from app.services.run_service import (
     create_run_record,
     process_run,
     get_run_for_user,
     list_runs_for_user,
+    create_or_enable_share_for_run,
+    get_public_run_by_share_id,
 )
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
@@ -51,3 +53,15 @@ def get_run(run_id: str, user=Depends(get_current_user)):
         user_id=user["user_id"],
         run_id=run_id,
     )
+
+@router.post("/{run_id}/share", response_model=ShareRunOut)
+def share_run(run_id: str, user=Depends(get_current_user)):
+    return create_or_enable_share_for_run(
+        user_id=user["user_id"],
+        run_id=run_id,
+    )
+
+
+@router.get("/public/{share_id}", response_model=PublicRunOut)
+def get_public_run(share_id: str):
+    return get_public_run_by_share_id(share_id)
