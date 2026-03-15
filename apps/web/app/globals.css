@@ -1,14 +1,19 @@
 @media print {
+
   body {
-    background: white !important;
+    background: white;
   }
 
-  button,
+  header {
+    border: none;
+  }
+
+  button {
+    display: none;
+  }
+
   a {
-    display: none !important;
+    display: none;
   }
 
-  * {
-    box-shadow: none !important;
-  }
 }
