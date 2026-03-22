@@ -13,6 +13,9 @@ class Settings:
     # ── 数据库 ──
     DATABASE_URL: str = os.environ["DATABASE_URL"]  # PostgreSQL 连接串，格式: postgresql+psycopg://user:pass@host:port/db
 
+    # ── Redis（任务队列） ──
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+
     # ── Clerk 认证 ──
     CLERK_JWKS_URL: str = os.environ["CLERK_JWKS_URL"]  # Clerk JWKS 端点，用于验证 JWT 签名
     WEB_ORIGIN: str = os.getenv("WEB_ORIGIN", "http://localhost:3000")  # 前端地址，用于 CORS 白名单

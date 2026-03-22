@@ -8,4 +8,5 @@ openai
 PyJWT[crypto]
 pypdf
 python-docx
+arq
 
