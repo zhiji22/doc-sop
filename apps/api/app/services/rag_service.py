@@ -1,5 +1,6 @@
 import json
 import math
+from alembic.command import history
 from sqlalchemy import text
 
 from app.db.database import engine
@@ -81,6 +82,43 @@ def retrieve_relevant_chunks(user_id: str, file_id: str, question: str, top_k: i
   return scored[:top_k]
 
 
+# 构建历史对话
+def build_chat_history(user_id: str, file_id: str, max_rounds: int = 5) -> list[dict]:
+  """
+  从数据库取最近的聊天记录，转换成 OpenAI messages 格式。
+  要排除最后一条user信息
+  
+  参数:
+    - max_rounds: 最多取最近几轮对话（1轮 = 1条user + 1条assistant）
+      取太多会超出 LLM 上下文窗口，5轮是个安全值
+  
+  返回:
+    - [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+  """
+  # 取最近的消息 
+  recent_messages = list_qa_messages(
+    user_id=user_id,
+    file_id=file_id,
+    limit=max_rounds * 2 + 1,  # 多取一条，因为可能要去掉最后一条
+  )
+
+  # 如果最后一条是 user 消息，去掉它（那是当前刚存的问题，会在 prompt 里单独传）
+  if recent_messages and recent_messages[-1]["role"] == "user":
+    recent_messages = recent_messages[:-1]
+
+  # 只保留最近 max_rounds 轮
+  recent_messages = recent_messages[-(max_rounds * 2):]
+
+  history = []
+  for msg in recent_messages:
+    history.append({
+      "role": msg["role"],
+      "content": msg["content"]
+    })
+
+  return history
+
+
 def answer_question_with_rag(user_id: str, file_id: str, question: str):
   top_chunks = retrieve_relevant_chunks(
     user_id=user_id,
@@ -119,13 +157,20 @@ def answer_question_with_rag(user_id: str, file_id: str, question: str):
     {context_text}
     """
 
+  # 获取历史对话记录
+  history = build_chat_history(user_id=user_id, file_id=file_id, max_rounds=5)
+
+  # 构建完整的 messages 数组：system + 历史对话 + 当前问题
+  messages = [
+    {"role": "system", "content": "You answer questions using retrieved document context."},
+  ]
+  messages.extend(history)  # 把历史对话加进去
+  messages.append({"role": "user", "content": prompt})  # 当前问题放最后
+
   resp = llm_client.chat.completions.create(
     model=settings.LLM_MODEL,
     temperature=0.2,
-    messages=[
-      {"role": "system", "content": "You answer questions using retrieved document context."},
-      {"role": "user", "content": prompt},
-    ],
+    messages=messages,
   )
 
   answer = resp.choices[0].message.content or ""
@@ -181,15 +226,22 @@ def answer_question_with_rag_stream(user_id: str, file_id: str, question: str):
     {context_text}
   """
 
+  # 获取历史对话记录
+  history = build_chat_history(user_id=user_id, file_id=file_id, max_rounds=5)
+
+  # 构建完整的 messages 数组：system + 历史对话 + 当前问题
+  messages = [
+    {"role": "system", "content": "You answer questions using retrieved document context."},
+  ]
+  messages.extend(history)
+  messages.append({"role": "user", "content": prompt})
+
   # 2. 调用 LLM
   stream = llm_client.chat.completions.create(
     model=settings.LLM_MODEL,
     temperature=0.2,
     stream=True,
-    messages=[
-      {"role": "system", "content": "You answer questions using retrieved document context."},
-      {"role": "user", "content": prompt},
-    ],
+    messages=messages,
   )
 
   # 3. 返回一个 generator
