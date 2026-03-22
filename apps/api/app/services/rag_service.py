@@ -135,6 +135,96 @@ def answer_question_with_rag(user_id: str, file_id: str, question: str):
     "citations": citations,
   }
 
+
+def answer_question_with_rag_stream(user_id: str, file_id: str, question: str):
+  """
+  流式版本 RAG问答
+  - 调LLM时加了stream=True
+  - 返回的是一个generator, 每次yield一小段文本 token
+  - citations在第一次yield之前就准备好
+  """
+  # 1. 检索相关文档块
+  top_chunks = retrieve_relevant_chunks(
+    user_id=user_id,
+    file_id=file_id,
+    question=question,
+    top_k=4,
+  )
+
+  context_blocks = []
+  citations = []
+
+  for chunk in top_chunks:
+    snippet = chunk["content"][:300]
+    context_blocks.append(
+      f"[chunk {chunk['chunk_index']}]\n{chunk['content']}"
+    )
+    citations.append({
+      "chunk_id": chunk["id"],
+      "chunk_index": chunk["chunk_index"],
+      "snippet": snippet,
+    })
+
+  context_text = "\n\n".join(context_blocks)
+
+  prompt = f"""
+    You are a document Q&A assistant.
+
+    Answer the user's question only using the provided context.
+    If the answer cannot be found in the context, say clearly that the document does not provide enough information.
+    Be concise and practical.
+
+    Question:
+    {question}
+
+    Context:
+    {context_text}
+  """
+
+  # 2. 调用 LLM
+  stream = llm_client.chat.completions.create(
+    model=settings.LLM_MODEL,
+    temperature=0.2,
+    stream=True,
+    messages=[
+      {"role": "system", "content": "You answer questions using retrieved document context."},
+      {"role": "user", "content": prompt},
+    ],
+  )
+
+  # 3. 返回一个 generator
+  #    - 先 yield citations（前端需要知道引用了哪些文档块）
+  #    - 然后逐个 yield LLM 生成的 token
+  def generate():
+    # 第一条消息：把 citations 发给前端
+    yield {
+      "type": "citations",
+      "citations": citations,
+    }
+
+    full_answer = ""
+
+    # 遍历 LLM 的流式响应，每个 chunk 包含一小段文本
+    for chunk in stream:
+      # chunk.choices[0].delta.content 就是这一小段新生成的文本
+      delta = chunk.choices[0].delta
+      if delta.content:
+        full_answer += delta.content
+        yield {
+          "type": "token",
+          "token": delta.content,
+        }
+
+    # 最后一条消息：告诉前端流结束了，附带完整答案
+    yield {
+      "type": "done",
+      "answer": full_answer,
+    }
+
+  return generate(), citations
+
+
+
 def save_qa_message(user_id: str, file_id: str, role: str, content: str, citations=None):
   with engine.begin() as conn:
     conn.execute(

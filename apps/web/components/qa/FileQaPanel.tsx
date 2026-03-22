@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
-import { askFileQuestion, fetchQaMessages } from "@/lib/api";
+import { askFileQuestion, askFileQuestionStream, fetchQaMessages } from "@/lib/api";
 import type { FileItem, QaMessage } from "@/types";
 
 export function FileQaPanel({ file }: { file: FileItem | null }) {
@@ -25,9 +25,63 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
       setLoading(true);
       setError("");
 
-      await askFileQuestion(getToken, file.id, question.trim());
-      setQuestion("");
-      await loadMessages(file.id);
+      const userQuestion = question.trim();
+      setQuestion(""); // 立刻清空输入框
+      
+      // 1.  先把用户消息加到界面上 
+      const userMsg: QaMessage = {
+        id: `temp-user-${Date.now()}`,
+        file_id: file.id,
+        user_id: "",
+        role: "user",
+        content: userQuestion,
+        citations: [],
+      };
+      setMessages((prev) => [...prev, userMsg]);
+
+      // 2. 创建一个"正在生成"的assistant 消息占位
+      const assistantMsgId = `temp-assistant-${Date.now()}`;
+      const assistantMsg: QaMessage = {
+        id: assistantMsgId,
+        file_id: file.id,
+        user_id: "",
+        role: "assistant",
+        content: "",
+        citations: []
+      }
+
+      setMessages((prev) => [...prev, assistantMsg]);
+
+      // 3. 调用流式接口
+      await askFileQuestionStream(getToken, file.id, userQuestion, {
+        onCitations: (citations) => {
+          // 收到citations时，更新assistant消息的citations
+          setMessages((prev) => (
+            prev.map((msg) => (
+              msg.id === assistantMsgId ? {...msg, citations} : msg
+            ))
+          ))
+        },
+        onToken: (token) => {
+          // 每收到一个 token，追加到 assistant 消息的 content 后面
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? { ...msg, content: msg.content + token }
+                : msg
+            )
+          );
+        },
+        onDone: (_fullAnswer) => {
+          // 流结束，可以做一些收尾工作
+          // 答案已经通过 onToken 逐字拼好了，不需要额外处理
+        },
+        onError: (err) => {
+          setError(err);
+        },
+      })
+
+      // await loadMessages(file.id);
     } catch (err) {
       setError(String(err));
     } finally {
