@@ -243,3 +243,70 @@ export async function askFileQuestionStream(
     }
   }
 }
+
+// 多步骤文档分析
+export async function analyzeDocumentStream(
+  getToken: () => Promise<string | null>,
+  fileId: string,
+  task: string,
+  callbacks: {
+    onCitations: (citations: CitationItem[]) => void;
+    onToken: (token: string) => void;
+    onDone: (fullAnswer: string) => void;
+    onError: (error: string) => void;
+    onToolCall?: (toolName: string, toolArgs: Record<string, any>) => void;
+    onToolResult?: (toolName: string, resultPreview: string) => void;
+    onThought?: (thought: string) => void;
+  }
+): Promise<void> {
+  const token = await getToken();
+
+  const res = await fetch(
+    `${process.env.NEXT_PUBLIC_API_BASE}/v1/qa/analyze`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ file_id: fileId, question: task }),
+    }
+  );
+
+  if (!res.ok) {
+    callbacks.onError(await res.text());
+    return;
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    callbacks.onError("No response body");
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+
+    for (const part of parts) {
+      const line = part.trim();
+      if (!line.startsWith("data: ")) continue;
+      try {
+        const msg = JSON.parse(line.slice(6));
+        if (msg.type === "citations") callbacks.onCitations(msg.citations);
+        else if (msg.type === "token") callbacks.onToken(msg.token);
+        else if (msg.type === "done") callbacks.onDone(msg.answer);
+        else if (msg.type === "tool_call") callbacks.onToolCall?.(msg.tool_name, msg.tool_args);
+        else if (msg.type === "tool_result") callbacks.onToolResult?.(msg.tool_name, msg.result_preview);
+        else if (msg.type === "thought") callbacks.onThought?.(msg.content);
+      } catch {}
+    }
+  }
+}

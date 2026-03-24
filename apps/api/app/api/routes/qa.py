@@ -8,6 +8,7 @@ from app.services.rag_service import (
     answer_question_with_rag,
     answer_question_with_rag_stream,
     answer_with_tools_stream,
+    analyze_document_stream,
     save_qa_message,
     list_qa_messages,
 )
@@ -169,4 +170,59 @@ def get_messages(file_id: str, limit: int = Query(default=50, ge=1, le=200), use
     user_id=user["user_id"],
     file_id=file_id,
     limit=limit,
+  )
+
+
+@router.post("/analyze")
+def analyze_document(body: AskFileQuestionIn, user=Depends(get_current_user)):
+  """
+  多步骤文档分析接口。
+  和 /ask/agent 的区别：Agent 会先看文档全貌，再逐步深入分析。
+  适合复杂分析任务。
+  """
+  user_id = user["user_id"]
+
+  save_qa_message(
+    user_id=user_id,
+    file_id=body.file_id,
+    role="user",
+    content=body.question,
+    citations=[],
+  )
+
+  generator, citations = analyze_document_stream(
+    user_id=user_id,
+    file_id=body.file_id,
+    task=body.question,
+  )
+
+  def event_stream():
+    full_answer = ""
+    final_citations = []
+
+    for item in generator:
+      if item["type"] == "token":
+        full_answer += item["token"]
+      if item["type"] == "citations":
+        final_citations = item["citations"]
+
+      yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+      if item["type"] == "done":
+        save_qa_message(
+          user_id=user_id,
+          file_id=body.file_id,
+          role="assistant",
+          content=full_answer,
+          citations=final_citations,
+        )
+
+  return StreamingResponse(
+    event_stream(),
+    media_type="text/event-stream",
+    headers={
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
   )

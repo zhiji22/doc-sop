@@ -85,6 +85,49 @@ def retrieve_relevant_chunks(user_id: str, file_id: str, question: str, top_k: i
   return scored[:top_k]
 
 
+def get_all_chunk_previews(user_id: str, file_id: str) -> list[dict]:
+  """获取文档所有 chunk 的预览（前 80 个字符），用于 get_document_outline 工具。"""
+  with engine.begin() as conn:
+    rows = conn.execute(
+      text("""
+        select chunk_index, content
+        from public.file_chunks
+        where file_id = :file_id and user_id = :user_id
+        order by chunk_index asc
+      """),
+      {"file_id": file_id, "user_id": user_id},
+    ).mappings().all()
+
+    return [
+      {
+        "chunk_index": row["chunk_index"],
+        "preview": row["content"][:80].replace("\n", " ") + "..."
+      }
+      for row in rows
+    ]
+
+
+def get_chunk_by_index(user_id: str, file_id: str, chunk_index: int) -> dict | None:
+  """按索引精确读取某个 chunk 的完整内容。"""
+  with engine.begin() as conn:
+    row = conn.execute(
+      text("""
+        select chunk_index, content
+        from public.file_chunks
+        where file_id = :file_id and user_id = :user_id and chunk_index = :chunk_index
+      """),
+      {"file_id": file_id, "user_id": user_id, "chunk_index": chunk_index},
+    ).mappings().first()
+
+    if not row:
+      return None
+
+    return {
+      "chunk_index": row["chunk_index"],
+      "content": row["content"],
+    }
+
+
 # 构建历史对话
 def build_chat_history(user_id: str, file_id: str, max_rounds: int = 5) -> list[dict]:
   """
@@ -384,28 +427,32 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
           }
           
           # 执行工具
-          if tool_name == "search_document":
+          # 需要 user_id/file_id 的工具
+          if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index"):
             tool_result = TOOL_EXECUTORS[tool_name](
               user_id=user_id,
               file_id=file_id,
               arguments=tool_args,
             )
-            
-            search_chunks = retrieve_relevant_chunks(
-              user_id=user_id,
-              file_id=file_id,
-              question=tool_args.get("query", ""),
-              top_k=4,
-            )
-            for chunk in search_chunks:
-              citation = {
-                "chunk_id": chunk["id"],
-                "chunk_index": chunk["chunk_index"],
-                "snippet": chunk["content"][:300],
-              }
-              if citation not in all_citations:
-                all_citations.append(citation)
+
+            # 如果是搜索工具，提取 citations
+            if tool_name == "search_document":
+              search_chunks = retrieve_relevant_chunks(
+                user_id=user_id,
+                file_id=file_id,
+                question=tool_args.get("query", ""),
+                top_k=4,
+              )
+              for chunk in search_chunks:
+                citation = {
+                  "chunk_id": chunk["id"],
+                  "chunk_index": chunk["chunk_index"],
+                  "snippet": chunk["content"][:300],
+                }
+                if citation not in all_citations:
+                  all_citations.append(citation)
           else:
+            # 不需要 user_id/file_id 的工具（如 summarize_text）
             tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
           
           # Observation — 工具结果
@@ -455,6 +502,130 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
     }
   
   return generate(), all_citations
+
+
+def analyze_document_stream(user_id: str, file_id: str, task: str):
+  """
+  多步骤文档分析模式。
+  和 answer_with_tools_stream 的区别：
+  - system prompt 要求 Agent 先制定分析计划，再逐步执行
+  - 适合复杂任务如"完整分析"、"对比章节"、"提取所有要点"
+  """
+  history = build_chat_history(user_id=user_id, file_id=file_id, max_rounds=3)
+
+  messages = [
+    {
+      "role": "system",
+      "content": (
+        "You are a document analysis agent. You perform thorough, multi-step analysis.\n\n"
+        "You have access to tools to explore and analyze the document.\n"
+        "You do NOT have the document content in memory.\n\n"
+        "For EVERY analysis task, follow this process:\n"
+        "1. PLAN: First use get_document_outline to understand the document structure\n"
+        "2. GATHER: Use read_chunk_by_index and search_document to collect relevant information\n"
+        "3. ANALYZE: After gathering enough data, provide a comprehensive analysis\n\n"
+        "Always be thorough — read multiple sections, don't rely on a single search.\n"
+        "Always respond in the same language as the user's request.\n"
+        "Structure your final answer with clear headings and sections."
+      ),
+    },
+  ]
+  messages.extend(history)
+  messages.append({"role": "user", "content": task})
+
+  all_citations = []
+
+  def generate():
+    nonlocal all_citations
+
+    yield {"type": "citations", "citations": []}
+
+    max_iterations = 12  # 分析任务需要更多轮
+    iteration = 0
+
+    while iteration < max_iterations:
+      iteration += 1
+
+      response = llm_client.chat.completions.create(
+        model=settings.LLM_MODEL,
+        temperature=0.2,
+        messages=messages,
+        tools=ALL_TOOL_SCHEMAS,
+        tool_choice="auto",
+      )
+
+      assistant_message = response.choices[0].message
+      content = assistant_message.content or ""
+      has_tool_calls = bool(assistant_message.tool_calls)
+
+      if content and has_tool_calls:
+        yield {"type": "thought", "content": content}
+
+      if has_tool_calls:
+        messages.append(assistant_message)
+
+        for tool_call in assistant_message.tool_calls:
+          tool_name = tool_call.function.name
+          tool_args = json.loads(tool_call.function.arguments)
+
+          yield {
+            "type": "tool_call",
+            "tool_name": tool_name,
+            "tool_args": tool_args,
+          }
+
+          if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index"):
+              tool_result = TOOL_EXECUTORS[tool_name](
+                user_id=user_id,
+                file_id=file_id,
+                arguments=tool_args,
+              )
+              if tool_name == "search_document":
+                search_chunks = retrieve_relevant_chunks(
+                  user_id=user_id,
+                  file_id=file_id,
+                  question=tool_args.get("query", ""),
+                  top_k=4,
+                )
+                for chunk in search_chunks:
+                  citation = {
+                    "chunk_id": chunk["id"],
+                    "chunk_index": chunk["chunk_index"],
+                    "snippet": chunk["content"][:300],
+                  }
+                  if citation not in all_citations:
+                    all_citations.append(citation)
+          else:
+            tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
+
+          yield {
+            "type": "tool_result",
+            "tool_name": tool_name,
+            "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result,
+          }
+
+          messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": tool_result,
+          })
+
+        yield {"type": "citations", "citations": all_citations}
+        continue
+
+      else:
+        chunk_size = 5
+        for i in range(0, len(content), chunk_size):
+          yield {"type": "token", "token": content[i:i + chunk_size]}
+
+        yield {"type": "done", "answer": content}
+        return
+
+    yield {"type": "token", "token": "已达到最大分析步数。"}
+    yield {"type": "done", "answer": "已达到最大分析步数。"}
+
+  return generate(), all_citations
+
 
 
 def save_qa_message(user_id: str, file_id: str, role: str, content: str, citations=None):

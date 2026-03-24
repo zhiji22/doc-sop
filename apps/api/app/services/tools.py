@@ -117,3 +117,90 @@ TOOL_EXECUTORS = {
   "summarize_text": execute_summarize_text,
 }
 
+# ============================================================
+# 工具 3：获取文档大纲
+# ============================================================
+
+GET_DOCUMENT_OUTLINE_SCHEMA = {
+  "type": "function",
+  "function": {
+    "name": "get_document_outline",
+    "description": (
+      "Get an outline/overview of the entire document. "
+      "Returns the total number of chunks and a preview (first 80 characters) of each chunk. "
+      "Use this FIRST when you need to understand the document's structure before diving into details."
+    ),
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+    },
+  },
+}
+
+def execute_get_document_outline(user_id: str, file_id: str, arguments: dict) -> str:
+  from app.services.rag_service import get_all_chunk_previews
+
+  previews = get_all_chunk_previews(user_id=user_id, file_id=file_id)
+
+  if not previews:
+    return "No document chunks found. The document may not have been processed yet."
+
+  lines = [f"Document has {len(previews)} chunks:\n"]
+  for p in previews:
+    lines.append(f"  [{p['chunk_index']}] {p['preview']}")
+
+  return "\n".join(lines)
+
+
+# ============================================================
+# 工具 4：按索引读取指定段落
+# ============================================================
+
+READ_CHUNK_BY_INDEX_SCHEMA = {
+  "type": "function",
+  "function": {
+    "name": "read_chunk_by_index",
+    "description": (
+      "Read the full content of a specific document chunk by its index number. "
+      "Use this after get_document_outline to read specific sections in detail. "
+      "The chunk_index is the number shown in square brackets in the outline."
+    ),
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "chunk_index": {
+          "type": "integer",
+          "description": "The index of the chunk to read (0-based).",
+        },
+      },
+      "required": ["chunk_index"],
+    },
+  },
+}
+
+def execute_read_chunk_by_index(user_id: str, file_id: str, arguments: dict) -> str:
+  from app.services.rag_service import get_chunk_by_index
+
+  chunk_index = arguments.get("chunk_index", 0)
+  chunk = get_chunk_by_index(user_id=user_id, file_id=file_id, chunk_index=chunk_index)
+
+  if not chunk:
+    return f"Chunk {chunk_index} not found."
+
+  return f"[Chunk {chunk_index}]\n{chunk['content']}"
+
+
+ALL_TOOL_SCHEMAS = [
+  SEARCH_DOCUMENT_SCHEMA,
+  SUMMARIZE_TEXT_SCHEMA,
+  GET_DOCUMENT_OUTLINE_SCHEMA,
+  READ_CHUNK_BY_INDEX_SCHEMA,
+]
+
+TOOL_EXECUTORS = {
+  "search_document": execute_search_document,
+  "summarize_text": execute_summarize_text,
+  "get_document_outline": execute_get_document_outline,
+  "read_chunk_by_index": execute_read_chunk_by_index,
+}
