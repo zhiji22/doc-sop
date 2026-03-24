@@ -282,167 +282,179 @@ def answer_question_with_rag_stream(user_id: str, file_id: str, question: str):
 # 带有tool的流式回答
 def answer_with_tools_stream(user_id: str, file_id: str, question: str):
   """
-  带 Tool Calling 的流式问答（Agent 模式）。
+  ReAct Agent 模式的流式问答。
   
-  和之前的 answer_question_with_rag_stream 的核心区别：
-  - 之前：我们的代码硬编码了"先搜索文档，再让 LLM 回答"
-  - 现在：LLM 自己决定要不要搜索、搜什么、搜几次
+  ReAct = Reasoning（思考） + Acting（行动）
   
-  流程：
-  1. 把用户问题 + 工具列表发给 LLM
-  2. LLM 可能返回"我要调用工具"（tool_calls）或"直接回答"（content）
-  3. 如果是 tool_calls，执行工具，把结果传回给 LLM
-  4. 重复 2-3，直到 LLM 给出最终回答
-  5. 整个过程通过 SSE 流式推送给前端
+  每一轮循环的结构：
+  1. Thought — LLM 分析当前情况，解释接下来要做什么
+  2. Action — LLM 决定调用哪个工具（或直接给出最终答案）
+  3. Observation — 工具执行结果
+  4. 回到 1，直到 LLM 给出最终答案
+  
+  SSE 消息类型：
+  - thought: Agent 的思考过程
+  - tool_call: 正在调用工具
+  - tool_result: 工具执行结果
+  - citations: 引用的文档块
+  - token: 最终回答的文本片段
+  - done: 流结束
   """
   # 获取历史对话
   history = build_chat_history(user_id=user_id, file_id=file_id, max_rounds=5)
-  # 构建初始 messages
+  
+  # ReAct 的关键：system prompt 要求 LLM 显式输出思考过程
   messages = [
     {
       "role": "system",
       "content": (
-        "You are a document Q&A assistant. "
-        "You have access to tools to search the uploaded document. "
-        "IMPORTANT: You do NOT have the document content in memory. "
-        "You MUST use the search_document tool to retrieve content from the document before answering any question about it. "
-        "Always use search_document first when the user asks about the document content, summary, or any information from the document. "
-        "The summarize_text tool is only for reformatting text you have already retrieved. "
-        "If the user's question is a greeting or doesn't need document information, respond directly without using tools. "
-        "Always respond in the same language as the user's question. "
-        "Always be concise and practical."
+        "You are a document Q&A assistant that follows the ReAct pattern.\n\n"
+        "You have access to tools to search the uploaded document.\n"
+        "You do NOT have the document content in memory — you MUST use search_document to retrieve it.\n\n"
+        "For EVERY question about the document, follow this process:\n"
+        "1. First, think about what information you need (your thinking will be shown to the user)\n"
+        "2. Use the appropriate tool to get that information\n"
+        "3. After getting the tool result, think about whether you have enough information\n"
+        "4. Either use another tool or provide your final answer\n\n"
+        "When you decide to think, output your reasoning as regular text content.\n"
+        "When you decide to act, use the tool_calls mechanism.\n"
+        "When you have enough information, provide your final answer as regular text.\n\n"
+        "IMPORTANT:\n"
+        "- Always respond in the same language as the user's question.\n"
+        "- If the user is just greeting or chatting, respond directly without tools.\n"
+        "- Be concise and practical in your final answer."
       ),
     },
   ]
   messages.extend(history)
   messages.append({"role": "user", "content": question})
-
-  # 收集citations = []
+  
   all_citations = []
-
+  
   def generate():
     nonlocal all_citations
-
-    # 先发送citations占位
+    
     yield {
       "type": "citations",
-      "citations": []
+      "citations": [],
     }
-
-    max_iterations = 5
-    for iteration in range(max_iterations):
-      # 调用 LLM（带工具列表）
+    
+    # ReAct 循环
+    max_iterations = 8  # 比之前多一些，因为每轮可能有 thought + action 两步
+    iteration = 0
+    
+    while iteration < max_iterations:
+      iteration += 1
+      
+      # 调用 LLM
       response = llm_client.chat.completions.create(
         model=settings.LLM_MODEL,
         temperature=0.2,
         messages=messages,
-        tools=ALL_TOOL_SCHEMAS,    # 告诉 LLM 有哪些工具可用
-        tool_choice="auto",        #  LLM 自己决定用不用工具
+        tools=ALL_TOOL_SCHEMAS,
+        tool_choice="auto",
       )
-
+      
       assistant_message = response.choices[0].message
-
-      # 情况1：LLM 决定要调用工具
-      if assistant_message.tool_calls:
-        # 把 LLM 的回复（包含 tool_calls）加入 messages 历史
+      content = assistant_message.content or ""
+      has_tool_calls = bool(assistant_message.tool_calls)
+      
+      # ★ ReAct 的核心：LLM 可能同时返回 content（思考）和 tool_calls（行动）
+      # 也可能只返回其中一个
+      
+      # 如果有 content 且还有 tool_calls → 这是 Thought（思考步骤）
+      if content and has_tool_calls:
+        yield {
+          "type": "thought",
+          "content": content,
+        }
+      
+      # 如果有 tool_calls → 执行工具（Action 步骤）
+      if has_tool_calls:
         messages.append(assistant_message)
-
-        # 告诉前端 "Agent 正在使用工具"
+        
         for tool_call in assistant_message.tool_calls:
           tool_name = tool_call.function.name
           tool_args = json.loads(tool_call.function.arguments)
-
-          # 通知前端正在调用什么工具
+          
           yield {
             "type": "tool_call",
             "tool_name": tool_name,
             "tool_args": tool_args,
           }
-
+          
           # 执行工具
           if tool_name == "search_document":
-            # search_document需要user_id和file_id
             tool_result = TOOL_EXECUTORS[tool_name](
               user_id=user_id,
               file_id=file_id,
               arguments=tool_args,
             )
-
-            # 从搜索结果中提取citations
+            
             search_chunks = retrieve_relevant_chunks(
               user_id=user_id,
               file_id=file_id,
               question=tool_args.get("query", ""),
               top_k=4,
             )
-
             for chunk in search_chunks:
               citation = {
                 "chunk_id": chunk["id"],
                 "chunk_index": chunk["chunk_index"],
                 "snippet": chunk["content"][:300],
               }
-
-              # 避免重复添加
               if citation not in all_citations:
                 all_citations.append(citation)
-
           else:
-            # 其他工具直接执行
             tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
-
-          # 通知前端工具执行完毕
+          
+          # Observation — 工具结果
           yield {
             "type": "tool_result",
             "tool_name": tool_name,
-            "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
+            "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result,
           }
-
-          # 把工具结果加入 messages，让 LLM 看到
+          
           messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
             "content": tool_result,
           })
-
-        # 更新 citations
-        yield {
-            "type": "citations",
-            "citations": all_citations,
-        }
-        # 继续循环，让 LLM 根据工具结果决定下一步
-        continue
-
-      # 情况 2：LLM 直接给出最终回答（不调用工具）
-      else:
-        content = assistant_message.content or ""
         
+        yield {
+          "type": "citations",
+          "citations": all_citations,
+        }
+        
+        continue  # 回到循环顶部，让 LLM 继续思考
+      
+      # 如果只有 content 没有 tool_calls → 这是最终回答
+      else:
         # 流式输出最终回答
-        chunk_size = 5  # 每次发 5 个字符
+        chunk_size = 5
         for i in range(0, len(content), chunk_size):
           yield {
             "type": "token",
             "token": content[i:i + chunk_size],
           }
-
+        
         yield {
           "type": "done",
           "answer": content,
         }
-        return  # 结束 generator
-
-    # 如果循环了 5 次还没结束，强制结束
+        return
+    
+    # 超过最大迭代次数
     yield {
       "type": "token",
-      "token": "I've reached the maximum number of tool calls. Here's what I found so far.",
+      "token": "I've reached the maximum number of reasoning steps.",
     }
     yield {
       "type": "done",
-      "answer": "I've reached the maximum number of tool calls.",
+      "answer": "I've reached the maximum number of reasoning steps.",
     }
-
+  
   return generate(), all_citations
-
 
 
 def save_qa_message(user_id: str, file_id: str, role: str, content: str, citations=None):

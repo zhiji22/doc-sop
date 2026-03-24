@@ -170,6 +170,7 @@ export async function askFileQuestionStream(
     onError: (error: string) => void;
     onToolCall?: (toolName: string, toolArgs: Record<string, any>) => void;
     onToolResult?: (toolName: string, resultPreview: string) => void;
+    onThought?: (thought: string) => void;
   }
 ): Promise<void> {
   const token = await getToken();
@@ -232,6 +233,9 @@ export async function askFileQuestionStream(
         } else if (msg.type === "tool_result") {
           // 工具执行完毕
           callbacks.onToolResult?.(msg.tool_name, msg.result_preview);
+        } else if (msg.type === "thought") {
+          // 思考推理过程
+          callbacks.onThought?.(msg.content);
         }
       } catch {
         // JSON 解析失败，忽略

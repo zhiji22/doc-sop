@@ -97,6 +97,19 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
             )
           );
         },
+        onThought: (thought) => {
+          // Agent 的思考过程，用灰色斜体显示
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? {
+                    ...msg,
+                    content: msg.content + `\n💭 *${thought}*\n`,
+                  }
+                : msg
+            )
+          );
+        },
         onDone: (_fullAnswer) => {
           // 流结束，可以做一些收尾工作
           // 答案已经通过 onToken 逐字拼好了，不需要额外处理

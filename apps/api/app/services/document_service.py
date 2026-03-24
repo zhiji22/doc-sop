@@ -43,12 +43,14 @@ def parse_document(filename: str, mime: str | None, file_bytes: bytes) -> str:
     mime = mime or ""
 
     if lower_name.endswith(".pdf") or mime == "application/pdf":
-        return parse_pdf(file_bytes)
+        raw = parse_pdf(file_bytes)
+    elif lower_name.endswith(".docx") or mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        raw = parse_docx(file_bytes)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF and DOCX are supported for now.")
 
-    if lower_name.endswith(".docx") or mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        return parse_docx(file_bytes)
-
-    raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF and DOCX are supported for now.")
+    # 去除 NUL 字节，PostgreSQL text 字段不允许 \x00
+    return raw.replace("\x00", "")
 
 
 def truncate_text(text: str, max_chars: int = 12000) -> str:
