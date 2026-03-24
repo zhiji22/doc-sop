@@ -168,12 +168,14 @@ export async function askFileQuestionStream(
     onToken: (token: string) => void;
     onDone: (fullAnswer: string) => void;
     onError: (error: string) => void;
+    onToolCall?: (toolName: string, toolArgs: Record<string, any>) => void;
+    onToolResult?: (toolName: string, resultPreview: string) => void;
   }
 ): Promise<void> {
   const token = await getToken();
 
   const res = await fetch(
-    `${process.env.NEXT_PUBLIC_API_BASE}/v1/qa/ask/stream`,
+    `${process.env.NEXT_PUBLIC_API_BASE}/v1/qa/ask/agent`,
     {
       method: "POST",
       headers: {
@@ -186,11 +188,12 @@ export async function askFileQuestionStream(
       }),
     }
   );
+
   if (!res.ok) {
     callbacks.onError(await res.text());
     return;
   }
-  // res.body 是一个 ReadableStream，我们用 reader 逐块读取
+
   const reader = res.body?.getReader();
   if (!reader) {
     callbacks.onError("No response body");
@@ -198,27 +201,21 @@ export async function askFileQuestionStream(
   }
 
   const decoder = new TextDecoder();
-  let buffer = "";  // 缓冲区，因为一次 read 可能包含多条 SSE 消息，也可能只有半条
+  let buffer = "";
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
 
-    // 把二进制数据解码成字符串，追加到缓冲区
     buffer += decoder.decode(value, { stream: true });
-
-    // 按 "\n\n" 分割，每个完整的 SSE 消息以 "\n\n" 结尾
     const parts = buffer.split("\n\n");
-
-    // 最后一个 part 可能是不完整的消息，留在缓冲区
     buffer = parts.pop() || "";
 
     for (const part of parts) {
-      // 去掉 "data: " 前缀
       const line = part.trim();
       if (!line.startsWith("data: ")) continue;
 
-      const jsonStr = line.slice(6);  // "data: " 是 6 个字符
+      const jsonStr = line.slice(6);
 
       try {
         const msg = JSON.parse(jsonStr);
@@ -229,11 +226,16 @@ export async function askFileQuestionStream(
           callbacks.onToken(msg.token);
         } else if (msg.type === "done") {
           callbacks.onDone(msg.answer);
+        } else if (msg.type === "tool_call") {
+          // Agent 正在调用工具
+          callbacks.onToolCall?.(msg.tool_name, msg.tool_args);
+        } else if (msg.type === "tool_result") {
+          // 工具执行完毕
+          callbacks.onToolResult?.(msg.tool_name, msg.result_preview);
         }
       } catch {
-        // JSON 解析失败，忽略这条消息
+        // JSON 解析失败，忽略
       }
     }
   }
-
 }

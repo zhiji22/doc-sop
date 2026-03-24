@@ -72,6 +72,31 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
             )
           );
         },
+        onToolCall: (toolName, toolArgs) => {
+          // Agent 正在调用工具时，在 assistant 消息中显示状态
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? {
+                    ...msg,
+                    content: msg.content + `\n🔧 Using tool: ${toolName}(${JSON.stringify(toolArgs)})\n`,
+                  }
+                : msg
+            )
+          );
+        },
+        onToolResult: (toolName, resultPreview) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? {
+                    ...msg,
+                    content: msg.content + `✅ Got result from ${toolName}\n\n`,
+                  }
+                : msg
+            )
+          );
+        },
         onDone: (_fullAnswer) => {
           // 流结束，可以做一些收尾工作
           // 答案已经通过 onToken 逐字拼好了，不需要额外处理

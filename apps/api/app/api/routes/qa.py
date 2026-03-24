@@ -7,6 +7,7 @@ from app.schemas.qa import AskFileQuestionIn, AskFileQuestionOut, QaMessageOut
 from app.services.rag_service import (
     answer_question_with_rag,
     answer_question_with_rag_stream,
+    answer_with_tools_stream,
     save_qa_message,
     list_qa_messages,
 )
@@ -101,6 +102,63 @@ def ask_question_stream(body: AskFileQuestionIn, user=Depends(get_current_user))
       "Cache-Control": "no-cache",  # 不缓存
       "Connection": "Keep-alive",   # 保持连接
       "X-Accel-Buffering": "no",    # 禁止 Nginx缓冲
+    }
+  )
+
+
+# 使用tool stream
+@router.post("/ask/agent")
+def ask_question_agent(body: AskFileQuestionIn, user=Depends(get_current_user)):
+  """
+  Agent 模式问答接口。
+  和 /ask/stream 的区别：LLM 自主决定是否搜索文档、搜什么。
+  SSE 消息类型多了 tool_call 和 tool_result。
+  """
+  user_id = user["user_id"]
+
+  save_qa_message(
+    user_id=user_id,
+    file_id=body.file_id,
+    role="user",
+    content=body.question,
+    citations=[],
+  )
+
+  generator, citations = answer_with_tools_stream(
+    user_id=user_id,
+    file_id=body.file_id,
+    question=body.question
+  )
+
+  def event_stream():
+    full_answer = ""
+    final_citations = []
+
+    for item in generator:
+      if item["type"] == "token":
+        full_answer += item["token"]
+
+      if item["type"] == "citations":
+        final_citations = item["citations"]
+
+      yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+      if item["type"] == "done":
+        save_qa_message(
+          user_id=user_id,
+          file_id=body.file_id,
+          role="assistant",
+          content=full_answer,
+          citations=final_citations,
+        )
+  
+  return StreamingResponse(
+    event_stream(),
+    media_type="text/event-stream",
+    headers={
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
     }
   )
 
