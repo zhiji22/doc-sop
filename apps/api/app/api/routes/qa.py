@@ -5,13 +5,15 @@ from fastapi.responses import StreamingResponse
 from app.api.deps import get_current_user
 from app.schemas.qa import AskFileQuestionIn, AskFileQuestionOut, QaMessageOut
 from app.services.rag_service import (
-    answer_question_with_rag,
-    answer_question_with_rag_stream,
-    answer_with_tools_stream,
-    analyze_document_stream,
-    save_qa_message,
-    list_qa_messages,
+  answer_question_with_rag,
+  answer_question_with_rag_stream,
+  answer_with_tools_stream,
+  analyze_document_stream,
+  save_qa_message,
+  list_qa_messages,
 )
+from app.services.multi_agent import multi_agent_stream
+
 
 router = APIRouter(prefix="/v1/qa", tags=["qa"])
 
@@ -203,6 +205,61 @@ def analyze_document(body: AskFileQuestionIn, user=Depends(get_current_user)):
     for item in generator:
       if item["type"] == "token":
         full_answer += item["token"]
+      if item["type"] == "citations":
+        final_citations = item["citations"]
+
+      yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+      if item["type"] == "done":
+        save_qa_message(
+          user_id=user_id,
+          file_id=body.file_id,
+          role="assistant",
+          content=full_answer,
+          citations=final_citations,
+        )
+
+  return StreamingResponse(
+    event_stream(),
+    media_type="text/event-stream",
+    headers={
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  )
+
+
+@router.post("/ask/multi-agent")
+def ask_multi_agent(body: AskFileQuestionIn, user=Depends(get_current_user)):
+  """
+  Multi-Agent 协作问答接口。
+  Planner 制定计划 → Executor 执行 → Reviewer 审查。
+  """
+  user_id = user["user_id"]
+
+  save_qa_message(
+    user_id=user_id,
+    file_id=body.file_id,
+    role="user",
+    content=body.question,
+    citations=[],
+  )
+
+  generator, citations = multi_agent_stream(
+    user_id=user_id,
+    file_id=body.file_id,
+    question=body.question,
+  )
+
+  def event_stream():
+    full_answer = ""
+    final_citations = []
+
+    for item in generator:
+      if item["type"] == "token":
+        full_answer += item["token"]
+        
       if item["type"] == "citations":
         final_citations = item["citations"]
 

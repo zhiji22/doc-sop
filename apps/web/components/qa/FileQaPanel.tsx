@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
-import { askFileQuestion, askFileQuestionStream, fetchQaMessages, analyzeDocumentStream } from "@/lib/api";
+import { askFileQuestion, askFileQuestionStream, fetchQaMessages, analyzeDocumentStream, multiAgentStream } from "@/lib/api";
 import type { FileItem, QaMessage } from "@/types";
 
 export function FileQaPanel({ file }: { file: FileItem | null }) {
@@ -208,6 +208,86 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
     }
   }
 
+  async function submitMultiAgent() {
+    if (!file || !question.trim()) return;
+
+    try {
+      setLoading(true);
+      setError("");
+
+      const task = question.trim();
+      setQuestion("");
+
+      const userMsg: QaMessage = {
+        id: `temp-user-${Date.now()}`,
+        file_id: file.id,
+        user_id: "",
+        role: "user",
+        content: `🤖 [Multi-Agent] ${task}`,
+        citations: [],
+      };
+      setMessages((prev) => [...prev, userMsg]);
+
+      const assistantMsgId = `temp-assistant-${Date.now()}`;
+      setMessages((prev) => [...prev, {
+        id: assistantMsgId,
+        file_id: file.id,
+        user_id: "",
+        role: "assistant",
+        content: "",
+        citations: [],
+      }]);
+
+      await multiAgentStream(getToken, file.id, task, {
+        onCitations: (citations) => {
+          setMessages((prev) =>
+            prev.map((msg) => msg.id === assistantMsgId ? { ...msg, citations } : msg)
+          );
+        },
+        onToken: (token) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId ? { ...msg, content: msg.content + token } : msg
+            )
+          );
+        },
+        onToolCall: (toolName, toolArgs) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? { ...msg, content: msg.content + `\n🔧 ${toolName}(${JSON.stringify(toolArgs)})\n` }
+                : msg
+            )
+          );
+        },
+        onToolResult: (toolName) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? { ...msg, content: msg.content + `✅ ${toolName} done\n` }
+                : msg
+            )
+          );
+        },
+        onThought: (thought) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? { ...msg, content: msg.content + `\n💭 *${thought}*\n` }
+                : msg
+            )
+          );
+        },
+        onDone: () => {},
+        onError: (err) => setError(err),
+      });
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   useEffect(() => {
     if (file?.id) {
       loadMessages(file.id).catch((err) => setError(String(err)));
@@ -245,6 +325,13 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
           style={{ background: "#4f46e5", color: "white", border: "none", borderRadius: 8, padding: "8px 16px", cursor: loading ? "not-allowed" : "pointer" }}
         >
           {loading ? "分析中..." : "📊 深度分析"}
+        </button>
+        <button
+          onClick={submitMultiAgent}
+          disabled={loading || !question.trim()}
+          style={{ background: "#059669", color: "white", border: "none", borderRadius: 8, padding: "8px 16px", cursor: loading || !question.trim() ? "not-allowed" : "pointer" }}
+        >
+          {loading ? "协作中..." : "🤖 多Agent"}
         </button>
       </div>
 
