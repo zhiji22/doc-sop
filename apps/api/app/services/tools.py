@@ -191,11 +191,108 @@ def execute_read_chunk_by_index(user_id: str, file_id: str, arguments: dict) -> 
   return f"[Chunk {chunk_index}]\n{chunk['content']}"
 
 
+# ============================================================
+# 工具 5：保存记忆
+# ============================================================
+
+SAVE_MEMORY_SCHEMA = {
+  "type": "function",
+  "function": {
+    "name": "save_memory",
+    "description": (
+      "Save an important piece of information to long-term memory. "
+      "Use this when the user explicitly asks you to remember something, "
+      "or when you discover a key fact/insight during analysis that should be remembered for future conversations. "
+      "Examples: user preferences, key findings, important facts about documents."
+    ),
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "The information to remember. Be concise but complete.",
+        },
+        "category": {
+          "type": "string",
+          "enum": ["fact", "preference", "insight", "general"],
+          "description": "Category of the memory. 'fact' for factual info, 'preference' for user preferences, 'insight' for analysis conclusions, 'general' for other.",
+        },
+      },
+      "required": ["content"],
+    },
+  },
+}
+
+def execute_save_memory(user_id: str, file_id: str, arguments: dict) -> str:
+  from app.services.memory_service import save_memory
+
+  content = arguments.get("content", "")
+  category = arguments.get("category", "general")
+
+  result = save_memory(
+    user_id=user_id,
+    content=content,
+    category=category,
+    file_id=file_id,
+  )
+  return f"Memory saved successfully (category: {category}): {content}"
+
+
+# ============================================================
+# 工具 6：召回记忆
+# ============================================================
+
+RECALL_MEMORY_SCHEMA = {
+  "type": "function",
+  "function": {
+    "name": "recall_memory",
+    "description": (
+      "Search your long-term memory for previously saved information. "
+      "Use this when the user asks about something you discussed before, "
+      "or when you need context from previous conversations. "
+      "This searches across ALL past conversations and documents."
+    ),
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "What to search for in memory. Be descriptive.",
+        },
+      },
+      "required": ["query"],
+    },
+  },
+}
+
+def execute_recall_memory(user_id: str, file_id: str, arguments: dict) -> str:
+  from app.services.memory_service import recall_memories
+
+  query = arguments.get("query", "")
+  memories = recall_memories(
+    user_id=user_id,
+    query=query,
+    top_k=5,
+    file_id=file_id,
+  )
+  
+  if not memories:
+    return "No relevant memories found."
+
+  parts = []
+  for m in memories:
+    parts.append(f"[{m['category']}] (score: {m['score']:.2f}) {m['content']}")
+
+  return "Found memories:\n" + "\n".join(parts)
+
+
 ALL_TOOL_SCHEMAS = [
   SEARCH_DOCUMENT_SCHEMA,
   SUMMARIZE_TEXT_SCHEMA,
   GET_DOCUMENT_OUTLINE_SCHEMA,
   READ_CHUNK_BY_INDEX_SCHEMA,
+  SAVE_MEMORY_SCHEMA,
+  RECALL_MEMORY_SCHEMA,
 ]
 
 TOOL_EXECUTORS = {
@@ -203,4 +300,6 @@ TOOL_EXECUTORS = {
   "summarize_text": execute_summarize_text,
   "get_document_outline": execute_get_document_outline,
   "read_chunk_by_index": execute_read_chunk_by_index,
+  "save_memory": execute_save_memory,
+  "recall_memory": execute_recall_memory,
 }

@@ -157,7 +157,7 @@ def process_run(run_id: str, user_id: str):
                 {
                     "run_id": run_id,
                     "user_id": user_id,
-                    "error": e.detail,
+                    "error": str(e.detail).replace("\x00", "")[:2000],
                 },
             )
 
@@ -173,7 +173,7 @@ def process_run(run_id: str, user_id: str):
                 {
                     "run_id": run_id,
                     "user_id": user_id,
-                    "error": str(e),
+                    "error": str(e).replace("\x00", "")[:2000],
                 },
             )
 

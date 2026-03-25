@@ -14,6 +14,8 @@ from app.services.tools import ALL_TOOL_SCHEMAS, TOOL_EXECUTORS
 
 
 def index_file_chunks(user_id: str, file_id: str, raw_text: str):
+  # 去除 NUL 字节，PostgreSQL text 字段不允许 \x00
+  raw_text = raw_text.replace("\x00", "")
   chunks = split_text_into_chunks(raw_text, chunk_size=1000, overlap=150)
 
   with engine.begin() as conn:
@@ -345,6 +347,23 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
   """
   # 获取历史对话
   history = build_chat_history(user_id=user_id, file_id=file_id, max_rounds=5)
+
+  # 自动召回长期记忆
+  from app.services.memory_service import recall_memories
+  relevant_memories = recall_memories(
+    user_id=user_id,
+    query=question,
+    top_k=3,
+    file_id=file_id,
+  )
+  memory_context = ""
+  if relevant_memories:
+    memory_parts = [f"- [{m['category']}] {m['content']}" for m in relevant_memories]
+    memory_context = (
+        "\n\nYou have the following relevant memories from previous conversations:\n"
+        + "\n".join(memory_parts)
+        + "\n\nUse these memories as context if they are relevant to the current question."
+    )
   
   # ReAct 的关键：system prompt 要求 LLM 显式输出思考过程
   messages = [
@@ -354,21 +373,23 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
         "You are a document Q&A assistant that follows the ReAct pattern.\n\n"
         "You have access to tools to search the uploaded document.\n"
         "You do NOT have the document content in memory — you MUST use search_document to retrieve it.\n\n"
+        "You also have long-term memory capabilities:\n"
+        "- Use save_memory to remember important facts, user preferences, or analysis insights\n"
+        "- Use recall_memory to search your past memories when needed\n"
+        "- When the user says 'remember this' or similar, use save_memory\n\n"
         "For EVERY question about the document, follow this process:\n"
-        "1. First, think about what information you need (your thinking will be shown to the user)\n"
+        "1. First, think about what information you need\n"
         "2. Use the appropriate tool to get that information\n"
         "3. After getting the tool result, think about whether you have enough information\n"
         "4. Either use another tool or provide your final answer\n\n"
-        "When you decide to think, output your reasoning as regular text content.\n"
-        "When you decide to act, use the tool_calls mechanism.\n"
-        "When you have enough information, provide your final answer as regular text.\n\n"
         "IMPORTANT:\n"
         "- Always respond in the same language as the user's question.\n"
         "- If the user is just greeting or chatting, respond directly without tools.\n"
         "- Be concise and practical in your final answer."
+        + memory_context
       ),
     },
-  ]
+]
   messages.extend(history)
   messages.append({"role": "user", "content": question})
   
@@ -428,7 +449,7 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
           
           # 执行工具
           # 需要 user_id/file_id 的工具
-          if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index"):
+          if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
             tool_result = TOOL_EXECUTORS[tool_name](
               user_id=user_id,
               file_id=file_id,
@@ -513,6 +534,23 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
   """
   history = build_chat_history(user_id=user_id, file_id=file_id, max_rounds=3)
 
+  from app.services.memory_service import recall_memories
+  relevant_memories = recall_memories(
+    user_id=user_id,
+    query=task,
+    top_k=3,
+    file_id=file_id,
+  )
+
+  memory_context = ""
+  if relevant_memories:
+    memory_parts = [f"- [{m['category']}] {m['content']}" for m in relevant_memories]
+    memory_context = (
+      "\n\nYou have the following relevant memories from previous conversations:\n"
+      + "\n".join(memory_parts)
+      + "\n\nUse these memories as context if they are relevant."
+    )
+
   messages = [
     {
       "role": "system",
@@ -527,6 +565,7 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
         "Always be thorough — read multiple sections, don't rely on a single search.\n"
         "Always respond in the same language as the user's request.\n"
         "Structure your final answer with clear headings and sections."
+        + memory_context
       ),
     },
   ]
@@ -574,7 +613,7 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
             "tool_args": tool_args,
           }
 
-          if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index"):
+          if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
               tool_result = TOOL_EXECUTORS[tool_name](
                 user_id=user_id,
                 file_id=file_id,
