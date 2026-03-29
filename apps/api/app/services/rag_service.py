@@ -10,6 +10,8 @@ from app.services.embedding_service import get_embedding
 from app.core.config import settings
 from app.services.llm_service import llm_client
 
+from app.services.guardrails import check_input, check_output, ExecutionGuard, InputGuardError, ExecutionGuardError
+
 from app.services.tools import ALL_TOOL_SCHEMAS, TOOL_EXECUTORS
 
 
@@ -345,6 +347,16 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
   - token: 最终回答的文本片段
   - done: 流结束
   """
+  # ── 输入护栏 ──
+  try:
+    question = check_input(question)
+  except InputGuardError as e:
+    err_msg = f"⚠️ {str(e)}"
+    def error_gen():
+      yield {"type": "token", "token": err_msg}
+      yield {"type": "done", "answer": err_msg}
+    return error_gen(), []
+  
   import time as _time
   from app.services.trace_service import create_trace, finish_trace, record_span
 
@@ -419,155 +431,177 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
     # ReAct 循环
     max_iterations = 8  # 比之前多一些，因为每轮可能有 thought + action 两步
     iteration = 0
-    
-    while iteration < max_iterations:
-      iteration += 1
 
-      # 计时开始
-      llm_start = _time.time()
-      
-      # 调用 LLM
-      response = llm_client.chat.completions.create(
-        model=settings.LLM_MODEL,
-        temperature=0.2,
-        messages=messages,
-        tools=ALL_TOOL_SCHEMAS,
-        tool_choice="auto",
-      )
+    # 护栏
+    guard = ExecutionGuard()
 
-       # 计时结束
-      llm_duration = int((_time.time() - llm_start) * 1000)
+    try:
 
-      # 统计 token
-      usage_tokens = 0
-      if getattr(response, "usage", None):
-        usage_tokens = getattr(response.usage, "total_tokens", 0) or 0
-      total_tokens += usage_tokens
-      span_count += 1
-      
-      assistant_message = response.choices[0].message
-      content = assistant_message.content or ""
-      has_tool_calls = bool(assistant_message.tool_calls)
-
-      # 记录 LLM 调用 span
-      record_span(
-        trace_id=trace_id,
-        span_type="llm_call",
-        name=settings.LLM_MODEL,
-        input_data=json.dumps(messages[-1], ensure_ascii=False)[:3000],
-        output_data=content[:3000],
-        duration_ms=llm_duration,
-        token_count=usage_tokens,
-        meta={"iteration": iteration, "has_tool_calls": has_tool_calls},
-      )
-      
-      # ★ ReAct 的核心：LLM 可能同时返回 content（思考）和 tool_calls（行动）
-      # 也可能只返回其中一个
-      
-      # 如果有 content 且还有 tool_calls → 这是 Thought（思考步骤）
-      if content and has_tool_calls:
-        yield {
-          "type": "thought",
-          "content": content,
-        }
-      
-      # 如果有 tool_calls → 执行工具（Action 步骤）
-      if has_tool_calls:
-        messages.append(assistant_message)
+      while iteration < max_iterations:
+        iteration += 1
         
-        for tool_call in assistant_message.tool_calls:
-          tool_name = tool_call.function.name
-          tool_args = json.loads(tool_call.function.arguments)
-          
+        guard.check_timeout()  # 检查超时
+
+        # 计时开始
+        llm_start = _time.time()
+        
+        # 调用 LLM
+        response = llm_client.chat.completions.create(
+          model=settings.LLM_MODEL,
+          temperature=0.2,
+          messages=messages,
+          tools=ALL_TOOL_SCHEMAS,
+          tool_choice="auto",
+        )
+
+        # 计时结束
+        llm_duration = int((_time.time() - llm_start) * 1000)
+
+        # 统计 token
+        usage_tokens = 0
+        if getattr(response, "usage", None):
+          usage_tokens = getattr(response.usage, "total_tokens", 0) or 0
+        total_tokens += usage_tokens
+        span_count += 1
+
+        guard.add_tokens(usage_tokens)    # 累计 token
+        guard.check_tokens()              # token用量检查
+        
+        assistant_message = response.choices[0].message
+        content = assistant_message.content or ""
+        has_tool_calls = bool(assistant_message.tool_calls)
+
+        # 记录 LLM 调用 span
+        record_span(
+          trace_id=trace_id,
+          span_type="llm_call",
+          name=settings.LLM_MODEL,
+          input_data=json.dumps(messages[-1], ensure_ascii=False)[:3000],
+          output_data=content[:3000],
+          duration_ms=llm_duration,
+          token_count=usage_tokens,
+          meta={"iteration": iteration, "has_tool_calls": has_tool_calls},
+        )
+        
+        # ★ ReAct 的核心：LLM 可能同时返回 content（思考）和 tool_calls（行动）
+        # 也可能只返回其中一个
+        
+        # 如果有 content 且还有 tool_calls → 这是 Thought（思考步骤）
+        if content and has_tool_calls:
           yield {
-            "type": "tool_call",
-            "tool_name": tool_name,
-            "tool_args": tool_args,
+            "type": "thought",
+            "content": content,
           }
-
-          # 计时开始
-          tool_start = _time.time()
+        
+        # 如果有 tool_calls → 执行工具（Action 步骤）
+        if has_tool_calls:
+          messages.append(assistant_message)
           
-          # 执行工具
-          # 需要 user_id/file_id 的工具
-          if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
-            tool_result = TOOL_EXECUTORS[tool_name](
-              user_id=user_id,
-              file_id=file_id,
-              arguments=tool_args,
-            )
+          for tool_call in assistant_message.tool_calls:
+            guard.check_tool_call()  # 工具调用次数检查
+            tool_name = tool_call.function.name
+            tool_args = json.loads(tool_call.function.arguments)
+            
+            yield {
+              "type": "tool_call",
+              "tool_name": tool_name,
+              "tool_args": tool_args,
+            }
 
-            # 如果是搜索工具，提取 citations
-            if tool_name == "search_document":
-              search_chunks = retrieve_relevant_chunks(
+            # 计时开始
+            tool_start = _time.time()
+            
+            # 执行工具
+            # 需要 user_id/file_id 的工具
+            if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
+              tool_result = TOOL_EXECUTORS[tool_name](
                 user_id=user_id,
                 file_id=file_id,
-                question=tool_args.get("query", ""),
-                top_k=4,
+                arguments=tool_args,
               )
-              for chunk in search_chunks:
-                citation = {
-                  "chunk_id": chunk["id"],
-                  "chunk_index": chunk["chunk_index"],
-                  "snippet": chunk["content"][:300],
-                }
-                if citation not in all_citations:
-                  all_citations.append(citation)
-          else:
-            # 不需要 user_id/file_id 的工具（如 summarize_text）
-            tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
 
-          # 计时结束 + 记录 span
-          tool_duration = int((_time.time() - tool_start) * 1000)
-          span_count += 1
-          record_span(
-            trace_id=trace_id,
-            span_type="tool_call",
-            name=tool_name,
-            input_data=json.dumps(tool_args, ensure_ascii=False),
-            output_data=tool_result[:2000],
-            duration_ms=tool_duration,
-          )
+              # 如果是搜索工具，提取 citations
+              if tool_name == "search_document":
+                search_chunks = retrieve_relevant_chunks(
+                  user_id=user_id,
+                  file_id=file_id,
+                  question=tool_args.get("query", ""),
+                  top_k=4,
+                )
+                for chunk in search_chunks:
+                  citation = {
+                    "chunk_id": chunk["id"],
+                    "chunk_index": chunk["chunk_index"],
+                    "snippet": chunk["content"][:300],
+                  }
+                  if citation not in all_citations:
+                    all_citations.append(citation)
+            else:
+              # 不需要 user_id/file_id 的工具（如 summarize_text）
+              tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
+
+            # 计时结束 + 记录 span
+            tool_duration = int((_time.time() - tool_start) * 1000)
+            span_count += 1
+            record_span(
+              trace_id=trace_id,
+              span_type="tool_call",
+              name=tool_name,
+              input_data=json.dumps(tool_args, ensure_ascii=False),
+              output_data=tool_result[:2000],
+              duration_ms=tool_duration,
+            )
+            
+            # Observation — 工具结果
+            yield {
+              "type": "tool_result",
+              "tool_name": tool_name,
+              "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result,
+            }
+            
+            messages.append({
+              "role": "tool",
+              "tool_call_id": tool_call.id,
+              "content": tool_result,
+            })
           
-          # Observation — 工具结果
           yield {
-            "type": "tool_result",
-            "tool_name": tool_name,
-            "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result,
+            "type": "citations",
+            "citations": all_citations,
           }
           
-          messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": tool_result,
-          })
+          continue  # 回到循环顶部，让 LLM 继续思考
         
-        yield {
-          "type": "citations",
-          "citations": all_citations,
-        }
-        
-        continue  # 回到循环顶部，让 LLM 继续思考
+        # 如果只有 content 没有 tool_calls → 这是最终回答
+        else:
+          # 流式输出最终回答
+          chunk_size = 5
+          for i in range(0, len(content), chunk_size):
+            yield {
+              "type": "token",
+              "token": content[i:i + chunk_size],
+            }
+
+          # 完成 Trace
+          total_duration = int((_time.time() - trace_start) * 1000)
+          finish_trace(trace_id, total_duration, total_tokens, span_count)
+          
+          content = check_output(content) # 输出护栏
+          yield {
+            "type": "done",
+            "answer": content,
+          }
+          return
+      pass
+
+    except ExecutionGuardError as e:
+      error_msg = f"\n\n⚠️ {str(e)}"
+      yield {"type": "token", "token": error_msg}
       
-      # 如果只有 content 没有 tool_calls → 这是最终回答
-      else:
-        # 流式输出最终回答
-        chunk_size = 5
-        for i in range(0, len(content), chunk_size):
-          yield {
-            "type": "token",
-            "token": content[i:i + chunk_size],
-          }
-
-        # 完成 Trace
-        total_duration = int((_time.time() - trace_start) * 1000)
-        finish_trace(trace_id, total_duration, total_tokens, span_count)
-        
-        yield {
-          "type": "done",
-          "answer": content,
-        }
-        return
+      total_duration = int((_time.time() - trace_start) * 1000)
+      finish_trace(trace_id, total_duration, total_tokens, span_count)
+      
+      yield {"type": "done", "answer": error_msg}
 
     # 完成 Trace
     total_duration = int((_time.time() - trace_start) * 1000)
@@ -593,6 +627,16 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
   - system prompt 要求 Agent 先制定分析计划，再逐步执行
   - 适合复杂任务如"完整分析"、"对比章节"、"提取所有要点"
   """
+  # --- 输入护栏 ---
+  try:
+    question = check_input(task)
+  except InputGuardError as e:
+    err_msg = f"⚠️ {str(e)}"
+    def error_gen():
+      yield {"type": "token", "token": err_msg}
+      yield {"type": "done", "answer": err_msg}
+    return error_gen(), []
+
   import time as _time
   from app.services.trace_service import create_trace, finish_trace, record_span
 
@@ -657,128 +701,153 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
     max_iterations = 12  # 分析任务需要更多轮
     iteration = 0
 
-    while iteration < max_iterations:
-      iteration += 1
+    # 护栏 guard
+    guard = ExecutionGuard()
 
-      # 计时开始
-      llm_start = _time.time()
+    try:
 
-      response = llm_client.chat.completions.create(
-        model=settings.LLM_MODEL,
-        temperature=0.2,
-        messages=messages,
-        tools=ALL_TOOL_SCHEMAS,
-        tool_choice="auto",
-      )
+      while iteration < max_iterations:
+        iteration += 1
 
-      # 计时结束
-      llm_duration = int((_time.time() - llm_start) * 1000)
+        guard.check_timeout() #超市检查
 
-      # 统计 token
-      usage_tokens = 0
-      if getattr(response, "usage", None):
-        usage_tokens = getattr(response.usage, "total_tokens", 0) or 0
-      total_tokens += usage_tokens
-      span_count += 1
+        # 计时开始
+        llm_start = _time.time()
 
-      assistant_message = response.choices[0].message
-      content = assistant_message.content or ""
-      has_tool_calls = bool(assistant_message.tool_calls)
+        response = llm_client.chat.completions.create(
+          model=settings.LLM_MODEL,
+          temperature=0.2,
+          messages=messages,
+          tools=ALL_TOOL_SCHEMAS,
+          tool_choice="auto",
+        )
 
-      # 记录 LLM 调用 span
-      record_span(
-        trace_id=trace_id,
-        span_type="llm_call",
-        name=settings.LLM_MODEL,
-        input_data=json.dumps(messages[-1], ensure_ascii=False)[:3000],
-        output_data=content[:3000],
-        duration_ms=llm_duration,
-        token_count=usage_tokens,
-        meta={"iteration": iteration, "has_tool_calls": has_tool_calls},
-      )
+        # 计时结束
+        llm_duration = int((_time.time() - llm_start) * 1000)
 
-      if content and has_tool_calls:
-        yield {"type": "thought", "content": content}
+        # 统计 token
+        usage_tokens = 0
+        if getattr(response, "usage", None):
+          usage_tokens = getattr(response.usage, "total_tokens", 0) or 0
+        total_tokens += usage_tokens
+        span_count += 1
 
-      if has_tool_calls:
-        messages.append(assistant_message)
+        guard.add_tokens(usage_tokens)    # 累计 token
+        guard.check_tokens()              # token 用量检查
 
-        for tool_call in assistant_message.tool_calls:
-          tool_name = tool_call.function.name
-          tool_args = json.loads(tool_call.function.arguments)
+        assistant_message = response.choices[0].message
+        content = assistant_message.content or ""
+        has_tool_calls = bool(assistant_message.tool_calls)
 
-          yield {
-            "type": "tool_call",
-            "tool_name": tool_name,
-            "tool_args": tool_args,
-          }
+        # 记录 LLM 调用 span
+        record_span(
+          trace_id=trace_id,
+          span_type="llm_call",
+          name=settings.LLM_MODEL,
+          input_data=json.dumps(messages[-1], ensure_ascii=False)[:3000],
+          output_data=content[:3000],
+          duration_ms=llm_duration,
+          token_count=usage_tokens,
+          meta={"iteration": iteration, "has_tool_calls": has_tool_calls},
+        )
 
-          # 计时开始
-          tool_start = _time.time()
+        if content and has_tool_calls:
+          yield {"type": "thought", "content": content}
 
-          if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
-              tool_result = TOOL_EXECUTORS[tool_name](
-                user_id=user_id,
-                file_id=file_id,
-                arguments=tool_args,
-              )
+        if has_tool_calls:
+          messages.append(assistant_message)
 
-              if tool_name == "search_document":
-                search_chunks = retrieve_relevant_chunks(
+          for tool_call in assistant_message.tool_calls:
+            guard.check_tool_call() # 工具调用次数检查
+            
+            tool_name = tool_call.function.name
+            tool_args = json.loads(tool_call.function.arguments)
+
+            yield {
+              "type": "tool_call",
+              "tool_name": tool_name,
+              "tool_args": tool_args,
+            }
+
+            # 计时开始
+            tool_start = _time.time()
+
+            if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
+                tool_result = TOOL_EXECUTORS[tool_name](
                   user_id=user_id,
                   file_id=file_id,
-                  question=tool_args.get("query", ""),
-                  top_k=4,
+                  arguments=tool_args,
                 )
-                for chunk in search_chunks:
-                  citation = {
-                    "chunk_id": chunk["id"],
-                    "chunk_index": chunk["chunk_index"],
-                    "snippet": chunk["content"][:300],
-                  }
-                  if citation not in all_citations:
-                    all_citations.append(citation)
-          else:
-            tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
 
-          # 计时结束 + 记录 span
-          tool_duration = int((_time.time() - tool_start) * 1000)
-          span_count += 1
-          record_span(
-            trace_id=trace_id,
-            span_type="tool_call",
-            name=tool_name,
-            input_data=json.dumps(tool_args, ensure_ascii=False),
-            output_data=tool_result[:2000],
-            duration_ms=tool_duration,
-          )
+                if tool_name == "search_document":
+                  search_chunks = retrieve_relevant_chunks(
+                    user_id=user_id,
+                    file_id=file_id,
+                    question=tool_args.get("query", ""),
+                    top_k=4,
+                  )
+                  for chunk in search_chunks:
+                    citation = {
+                      "chunk_id": chunk["id"],
+                      "chunk_index": chunk["chunk_index"],
+                      "snippet": chunk["content"][:300],
+                    }
+                    if citation not in all_citations:
+                      all_citations.append(citation)
+            else:
+              tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
 
-          yield {
-            "type": "tool_result",
-            "tool_name": tool_name,
-            "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result,
-          }
+            # 计时结束 + 记录 span
+            tool_duration = int((_time.time() - tool_start) * 1000)
+            span_count += 1
+            record_span(
+              trace_id=trace_id,
+              span_type="tool_call",
+              name=tool_name,
+              input_data=json.dumps(tool_args, ensure_ascii=False),
+              output_data=tool_result[:2000],
+              duration_ms=tool_duration,
+            )
 
-          messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": tool_result,
-          })
+            yield {
+              "type": "tool_result",
+              "tool_name": tool_name,
+              "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result,
+            }
 
-        yield {"type": "citations", "citations": all_citations}
-        continue
+            messages.append({
+              "role": "tool",
+              "tool_call_id": tool_call.id,
+              "content": tool_result,
+            })
 
-      else:
-        chunk_size = 5
-        for i in range(0, len(content), chunk_size):
-          yield {"type": "token", "token": content[i:i + chunk_size]}
+          yield {"type": "citations", "citations": all_citations}
+          continue
 
-        # 完成 Trace
-        total_duration = int((_time.time() - trace_start) * 1000)
-        finish_trace(trace_id, total_duration, total_tokens, span_count)
+        else:
+          chunk_size = 5
+          for i in range(0, len(content), chunk_size):
+            yield {"type": "token", "token": content[i:i + chunk_size]}
 
-        yield {"type": "done", "answer": content}
-        return
+          # 完成 Trace
+          total_duration = int((_time.time() - trace_start) * 1000)
+          finish_trace(trace_id, total_duration, total_tokens, span_count)
+
+          content = check_output(content)    #输出护栏
+
+          yield {"type": "done", "answer": content}
+          return
+      
+      pass
+
+    except ExecutionGuardError as e:
+      error_msg = f"\n\n⚠️ {str(e)}"
+      yield {"type": "token", "token": error_msg}
+      
+      total_duration = int((_time.time() - trace_start) * 1000)
+      finish_trace(trace_id, total_duration, total_tokens, span_count)
+      
+      yield {"type": "done", "answer": error_msg}
 
     # 完成 Trace
     total_duration = int((_time.time() - trace_start) * 1000)

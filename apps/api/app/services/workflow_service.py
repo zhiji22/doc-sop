@@ -10,6 +10,8 @@ from app.services.tools import ALL_TOOL_SCHEMAS, TOOL_EXECUTORS
 from app.services.rag_service import retrieve_relevant_chunks, build_chat_history
 from app.services.trace_service import create_trace, finish_trace, record_span
 
+from app.services.guardrails import check_input, check_output, ExecutionGuard, InputGuardError, ExecutionGuardError
+
 
 def create_workflow(user_id: str, name: str, description: str, config: dict) -> dict:
   """创建一个新的 Workflow"""
@@ -144,7 +146,13 @@ def _run_steps_workflow(
     # 收集每一步的结果
     step_results = []
 
+    # 护栏
+    guard = ExecutionGuard()
+
     for i, step in enumerate(steps):
+      guard.check_timeout()
+      guard.check_tool_call()
+      
       # 如果是汇总步骤，跳过工具执行
       if step.get("synthesize"):
         yield {"type": "thought", "content": f"Step {i+1}: Synthesizing results..."}
@@ -266,6 +274,8 @@ def _run_steps_workflow(
     total_duration = int((_time.time() - trace_start) * 1000)
     finish_trace(trace_id, total_duration, total_tokens, span_count)
 
+    content = check_output(content)
+
     yield {"type": "done", "answer": content}
 
   return generate(), all_citations
@@ -279,6 +289,15 @@ def _run_free_agent_workflow(
   用用户自定义的 system_prompt，但让 Agent 自由决定用哪些工具。
   本质上就是 answer_with_tools_stream 的一个变体，只是 system_prompt 不同。
   """
+  # ── 输入护栏 ──
+  try:
+    question = check_input(question)
+  except InputGuardError as e:
+    def error_gen():
+      yield {"type": "token", "token": f"⚠️ {str(e)}"}
+      yield {"type": "done", "answer": f"⚠️ {str(e)}"}
+    return error_gen(), []
+
   all_citations = []
   total_tokens = 0
   span_count = 0
@@ -306,101 +325,125 @@ def _run_free_agent_workflow(
     yield {"type": "thought", "content": f"📋 Running workflow: {workflow_name}"}
 
     iteration = 0
-    while iteration < max_iterations:
-      iteration += 1
+    
+    # 护栏
+    guard = ExecutionGuard()
 
-      llm_start = _time.time()
-      response = llm_client.chat.completions.create(
-        model=settings.LLM_MODEL,
-        temperature=temperature,
-        messages=messages,
-        tools=ALL_TOOL_SCHEMAS,
-        tool_choice="auto",
-      )
-      llm_duration = int((_time.time() - llm_start) * 1000)
+    try:
 
-      usage_tokens = 0
-      if getattr(response, "usage", None):
-          usage_tokens = getattr(response.usage, "total_tokens", 0) or 0
-      total_tokens += usage_tokens
-      span_count += 1
+      while iteration < max_iterations:
+        iteration += 1
 
-      assistant_message = response.choices[0].message
-      content = assistant_message.content or ""
-      has_tool_calls = bool(assistant_message.tool_calls)
+        guard.check_timeout()
 
-      record_span(
-        trace_id=trace_id, span_type="llm_call", name=settings.LLM_MODEL,
-        input_data=json.dumps(messages[-1], ensure_ascii=False)[:3000],
-        output_data=content[:3000],
-        duration_ms=llm_duration, token_count=usage_tokens,
-        meta={"iteration": iteration, "has_tool_calls": has_tool_calls},
-      )
+        llm_start = _time.time()
+        response = llm_client.chat.completions.create(
+          model=settings.LLM_MODEL,
+          temperature=temperature,
+          messages=messages,
+          tools=ALL_TOOL_SCHEMAS,
+          tool_choice="auto",
+        )
+        llm_duration = int((_time.time() - llm_start) * 1000)
 
-      if content and has_tool_calls:
-        yield {"type": "thought", "content": content}
+        usage_tokens = 0
+        if getattr(response, "usage", None):
+            usage_tokens = getattr(response.usage, "total_tokens", 0) or 0
+        total_tokens += usage_tokens
+        span_count += 1
 
-      if has_tool_calls:
-        messages.append(assistant_message)
+        guard.add_tokens(usage_tokens)    # 累计 token
+        guard.check_tokens()              # token 用量检查
 
-        for tool_call in assistant_message.tool_calls:
-          tool_name = tool_call.function.name
-          tool_args = json.loads(tool_call.function.arguments)
+        assistant_message = response.choices[0].message
+        content = assistant_message.content or ""
+        has_tool_calls = bool(assistant_message.tool_calls)
 
-          yield {"type": "tool_call", "tool_name": tool_name, "tool_args": tool_args}
+        record_span(
+          trace_id=trace_id, span_type="llm_call", name=settings.LLM_MODEL,
+          input_data=json.dumps(messages[-1], ensure_ascii=False)[:3000],
+          output_data=content[:3000],
+          duration_ms=llm_duration, token_count=usage_tokens,
+          meta={"iteration": iteration, "has_tool_calls": has_tool_calls},
+        )
 
-          tool_start = _time.time()
-          if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
-            tool_result = TOOL_EXECUTORS[tool_name](
-              user_id=user_id, file_id=file_id, arguments=tool_args,
-            )
-            if tool_name == "search_document":
-              search_chunks = retrieve_relevant_chunks(
-                user_id=user_id, file_id=file_id,
-                question=tool_args.get("query", ""), top_k=4,
+        if content and has_tool_calls:
+          yield {"type": "thought", "content": content}
+
+        if has_tool_calls:
+          messages.append(assistant_message)
+
+          for tool_call in assistant_message.tool_calls:
+            guard.check_tool_call()
+
+            tool_name = tool_call.function.name
+            tool_args = json.loads(tool_call.function.arguments)
+
+            yield {"type": "tool_call", "tool_name": tool_name, "tool_args": tool_args}
+
+            tool_start = _time.time()
+            if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
+              tool_result = TOOL_EXECUTORS[tool_name](
+                user_id=user_id, file_id=file_id, arguments=tool_args,
               )
-              for chunk in search_chunks:
-                citation = {
-                  "chunk_id": chunk["id"],
-                  "chunk_index": chunk["chunk_index"],
-                  "snippet": chunk["content"][:300],
-                }
-                if citation not in all_citations:
-                  all_citations.append(citation)
-          else:
-            tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
+              if tool_name == "search_document":
+                search_chunks = retrieve_relevant_chunks(
+                  user_id=user_id, file_id=file_id,
+                  question=tool_args.get("query", ""), top_k=4,
+                )
+                for chunk in search_chunks:
+                  citation = {
+                    "chunk_id": chunk["id"],
+                    "chunk_index": chunk["chunk_index"],
+                    "snippet": chunk["content"][:300],
+                  }
+                  if citation not in all_citations:
+                    all_citations.append(citation)
+            else:
+              tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
 
-          tool_duration = int((_time.time() - tool_start) * 1000)
-          span_count += 1
-          record_span(
-            trace_id=trace_id, span_type="tool_call", name=tool_name,
-            input_data=json.dumps(tool_args, ensure_ascii=False),
-            output_data=tool_result[:2000],
-            duration_ms=tool_duration,
-          )
+            tool_duration = int((_time.time() - tool_start) * 1000)
+            span_count += 1
+            record_span(
+              trace_id=trace_id, span_type="tool_call", name=tool_name,
+              input_data=json.dumps(tool_args, ensure_ascii=False),
+              output_data=tool_result[:2000],
+              duration_ms=tool_duration,
+            )
 
-          yield {
-            "type": "tool_result", "tool_name": tool_name,
-            "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result,
-          }
+            yield {
+              "type": "tool_result", "tool_name": tool_name,
+              "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result,
+            }
 
-          messages.append({
-            "role": "tool", "tool_call_id": tool_call.id, "content": tool_result,
-          })
+            messages.append({
+              "role": "tool", "tool_call_id": tool_call.id, "content": tool_result,
+            })
 
-        yield {"type": "citations", "citations": all_citations}
-        continue
+          yield {"type": "citations", "citations": all_citations}
+          continue
 
-      else:
-          chunk_size = 5
-          for j in range(0, len(content), chunk_size):
-            yield {"type": "token", "token": content[j:j + chunk_size]}
+        else:
+            chunk_size = 5
+            for j in range(0, len(content), chunk_size):
+              yield {"type": "token", "token": content[j:j + chunk_size]}
 
-          total_duration = int((_time.time() - trace_start) * 1000)
-          finish_trace(trace_id, total_duration, total_tokens, span_count)
+            total_duration = int((_time.time() - trace_start) * 1000)
+            finish_trace(trace_id, total_duration, total_tokens, span_count)
 
-          yield {"type": "done", "answer": content}
-          return
+            content = check_output(content)    # 输出护栏
+
+            yield {"type": "done", "answer": content}
+            return
+      pass
+    except ExecutionGuardError as e:
+      error_msg = f"\n\n⚠️ {str(e)}"
+      yield {"type": "token", "token": error_msg}
+      
+      total_duration = int((_time.time() - trace_start) * 1000)
+      finish_trace(trace_id, total_duration, total_tokens, span_count)
+      
+      yield {"type": "done", "answer": error_msg}
 
     total_duration = int((_time.time() - trace_start) * 1000)
     finish_trace(trace_id, total_duration, total_tokens, span_count)
@@ -420,6 +463,16 @@ def run_workflow_stream(user_id: str, file_id: str, workflow_id: str, question: 
   2. 如果 config 有 steps → 按步骤执行
   3. 如果 config 没有 steps → 用自定义 system_prompt 做自由 Agent
   """
+  # ── 输入护栏（question 可能为空，空的话跳过检查）──
+  if question:
+    try:
+      question = check_input(question)
+    except InputGuardError as e:
+      def error_gen():
+        yield {"type": "token", "token": f"⚠️ {str(e)}"}
+        yield {"type": "done", "answer": f"⚠️ {str(e)}"}
+      return error_gen(), []
+
   workflow = get_workflow(workflow_id)
 
   if not workflow:

@@ -22,6 +22,8 @@ from app.services.rag_service import (
 from app.services.trace_service import create_trace, finish_trace, record_span
 from app.services.tools import ALL_TOOL_SCHEMAS, TOOL_EXECUTORS
 
+from app.services.guardrails import check_input, check_output, ExecutionGuard, InputGuardError, ExecutionGuardError
+
 
 # ============================================================
 # Agent 1: Planner（规划者）
@@ -128,8 +130,13 @@ def run_executor(
   max_iterations = 10
   iteration = 0
 
+  # 护栏 
+  guard = ExecutionGuard()
+
   while iteration < max_iterations:
     iteration += 1
+
+    guard.check_timeout() # 超时检查
 
     start = _time.time()
 
@@ -150,6 +157,10 @@ def run_executor(
     content = assistant_message.content or ""
     has_tool_calls = bool(assistant_message.tool_calls)
 
+    # token用量检查 
+    guard.add_tokens(tokens)
+    guard.check_tokens()
+
     if trace_id:
       record_span(
         trace_id=trace_id,
@@ -168,6 +179,7 @@ def run_executor(
       messages.append(assistant_message)
 
       for tool_call in assistant_message.tool_calls:
+        guard.check_tool_call() 
         tool_name = tool_call.function.name
         tool_args = json.loads(tool_call.function.arguments)
 
@@ -371,6 +383,16 @@ def multi_agent_stream(user_id: str, file_id: str, question: str):
   5. 输出最终回答
   """
 
+  # ── 输入护栏 ──
+  try:
+    question = check_input(question)
+  except InputGuardError as e:
+    err_msg = f"⚠️ {str(e)}"
+    def error_gen():
+      yield {"type": "token", "token": err_msg}
+      yield {"type": "done", "answer": err_msg}
+    return error_gen(), []
+
   trace_id = create_trace(
     user_id=user_id, file_id=file_id,
     question=question, agent_mode="multi-agent",
@@ -470,6 +492,8 @@ def multi_agent_stream(user_id: str, file_id: str, question: str):
       if review["approved"]:
         yield {"type": "thought", "content": "✅ [Reviewer] Answer approved!"}
         final_answer = review["improved_answer"]
+
+        final_answer = check_output(final_answer)
         
         total_tokens += review["tokens"]
 
@@ -498,6 +522,7 @@ def multi_agent_stream(user_id: str, file_id: str, question: str):
     for i in range(0, len(final_answer), chunk_size):
       yield {"type": "token", "token": final_answer[i:i + chunk_size]}
 
+    final_answer = check_output(final_answer)
     yield {"type": "done", "answer": final_answer}
 
   return generate(), all_citations
