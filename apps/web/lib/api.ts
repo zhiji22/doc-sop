@@ -384,3 +384,122 @@ export async function multiAgentStream(
     }
   }
 }
+
+// ============================================================
+// Workflow 相关 API
+// ============================================================
+
+/** 获取工作流列表 */
+export async function fetchWorkflows(
+  getToken: () => Promise<string | null>,
+): Promise<any[]> {
+  const token = await getToken();
+  const res = await fetch(`${process.env.NEXT_PUBLIC_API_BASE}/v1/workflows`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return [];
+  return res.json();
+}
+
+/** 创建工作流 */
+export async function createWorkflow(
+  getToken: () => Promise<string | null>,
+  data: { name: string; description: string; config: any },
+): Promise<any> {
+  const token = await getToken();
+  const res = await fetch(`${process.env.NEXT_PUBLIC_API_BASE}/v1/workflows`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(data),
+  });
+  return res.json();
+}
+
+/** 删除工作流 */
+export async function deleteWorkflow(
+  getToken: () => Promise<string | null>,
+  workflowId: string,
+): Promise<void> {
+  const token = await getToken();
+  await fetch(`${process.env.NEXT_PUBLIC_API_BASE}/v1/workflows/${workflowId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+/** 执行工作流（流式） */
+export async function runWorkflowStream(
+  getToken: () => Promise<string | null>,
+  fileId: string,
+  workflowId: string,
+  question: string,
+  callbacks: {
+    onCitations: (citations: CitationItem[]) => void;
+    onToken: (token: string) => void;
+    onDone: (fullAnswer: string) => void;
+    onError: (error: string) => void;
+    onToolCall?: (toolName: string, toolArgs: Record<string, any>) => void;
+    onToolResult?: (toolName: string, resultPreview: string) => void;
+    onThought?: (thought: string) => void;
+    onTraceId?: (traceId: string) => void;
+  }
+): Promise<void> {
+  const token = await getToken();
+
+  const res = await fetch(
+    `${process.env.NEXT_PUBLIC_API_BASE}/v1/workflows/run`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        file_id: fileId,
+        workflow_id: workflowId,
+        question,
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    callbacks.onError(await res.text());
+    return;
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    callbacks.onError("No response body");
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+
+    for (const part of parts) {
+      const line = part.trim();
+      if (!line.startsWith("data: ")) continue;
+      try {
+        const msg = JSON.parse(line.slice(6));
+        if (msg.type === "citations") callbacks.onCitations(msg.citations);
+        else if (msg.type === "token") callbacks.onToken(msg.token);
+        else if (msg.type === "done") callbacks.onDone(msg.answer);
+        else if (msg.type === "tool_call") callbacks.onToolCall?.(msg.tool_name, msg.tool_args);
+        else if (msg.type === "tool_result") callbacks.onToolResult?.(msg.tool_name, msg.result_preview);
+        else if (msg.type === "thought") callbacks.onThought?.(msg.content);
+        else if (msg.type === "trace_id") callbacks.onTraceId?.(msg.trace_id);
+      } catch {}
+    }
+  }
+}

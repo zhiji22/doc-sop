@@ -59,3 +59,10 @@ https://dashboard.clerk.com/apps/app_3AOHsnGJ0zau75BC2RSiPzTJmuO/instances/ins_3
 # 12.Multi-Agent 协作 — 比如"规划 Agent" + "执行 Agent" + "审查 Agent"
 # 13.Agent 可观测性 — 用 LangSmith / Phoenix 追踪每次 Agent 的决策链路
 # 14.用户自定义 Agent Workflow — 前端可视化编排 Agent 的工具和流程
+
+
+## Agent编排、Planner、ReAct
+Multi-Agent 编排
+  ├── Planner（规划）
+  ├── Executor（执行）──→ 内部是 ReAct 循环（思考→工具→观察→...）
+  └── Reviewer（审查）

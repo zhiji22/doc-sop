@@ -37,3 +37,5 @@ class Settings:
 
 # 全局单例，其他模块通过 from app.core.config import settings 使用
 settings = Settings()
+
+# 进入postgresql数据库：docker exec -it doc-sop-postgres psql -U postgres

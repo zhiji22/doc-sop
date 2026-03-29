@@ -2,7 +2,15 @@
 
 import { useEffect, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
-import { askFileQuestion, askFileQuestionStream, fetchQaMessages, analyzeDocumentStream, multiAgentStream } from "@/lib/api";
+import { 
+  askFileQuestion, 
+  askFileQuestionStream,
+  fetchQaMessages, 
+  analyzeDocumentStream, 
+  multiAgentStream, 
+  fetchWorkflows, 
+  runWorkflowStream, 
+} from "@/lib/api";
 import type { FileItem, QaMessage } from "@/types";
 
 export function FileQaPanel({ file }: { file: FileItem | null }) {
@@ -12,6 +20,10 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
   const [messages, setMessages] = useState<QaMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  // workflow
+  const [workflows, setWorkflows] = useState<any[]>([]);
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
 
   const [traceIds, setTraceIds] = useState<Record<string, string>>({});
 
@@ -299,12 +311,114 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
     }
   }
 
+  async function submitWorkflow() {
+    if (!file || !selectedWorkflowId) return;
+
+    try {
+      setLoading(true);
+      setError("");
+
+      const userQuestion = question.trim();
+      setQuestion("");
+
+      const selectedWf = workflows.find((w) => w.id === selectedWorkflowId);
+      const wfName = selectedWf?.name || "Workflow";
+
+      const userMsg: QaMessage = {
+        id: `temp-user-${Date.now()}`,
+        file_id: file.id,
+        user_id: "",
+        role: "user",
+        content: `⚙️ [${wfName}] ${userQuestion || "Run"}`,
+        citations: [],
+      };
+      setMessages((prev) => [...prev, userMsg]);
+
+      const assistantMsgId = `temp-assistant-${Date.now()}`;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: assistantMsgId,
+          file_id: file.id,
+          user_id: "",
+          role: "assistant",
+          content: "",
+          citations: [],
+        },
+      ]);
+
+      await runWorkflowStream(getToken, file.id, selectedWorkflowId, userQuestion, {
+        onCitations: (citations) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId ? { ...msg, citations } : msg
+            )
+          );
+        },
+        onToken: (token) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? { ...msg, content: msg.content + token }
+                : msg
+            )
+          );
+        },
+        onToolCall: (toolName, toolArgs) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? {
+                    ...msg,
+                    content:
+                      msg.content +
+                      `\n🔧 ${toolName}(${JSON.stringify(toolArgs)})\n`,
+                  }
+                : msg
+            )
+          );
+        },
+        onToolResult: (toolName) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? { ...msg, content: msg.content + `✅ ${toolName} done\n` }
+                : msg
+            )
+          );
+        },
+        onThought: (thought) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? { ...msg, content: msg.content + `\n💭 *${thought}*\n` }
+                : msg
+            )
+          );
+        },
+        onTraceId: (traceId) => {
+          setTraceIds((prev) => ({ ...prev, [assistantMsgId]: traceId }));
+        },
+        onDone: () => {},
+        onError: (err) => setError(err),
+      });
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   useEffect(() => {
     if (file?.id) {
       loadMessages(file.id).catch((err) => setError(String(err)));
     } else {
       setMessages([]);
     }
+
+    fetchWorkflows(getToken)
+      .then(setWorkflows)
+      .catch(() => {});
   }, [file?.id]);
 
   if (!file) {
@@ -345,6 +459,44 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
           {loading ? "协作中..." : "🤖 多Agent"}
         </button>
       </div>
+      {/* Workflow 选择器 */}
+      {workflows.length > 0 && (
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <select
+            value={selectedWorkflowId}
+            onChange={(e) => setSelectedWorkflowId(e.target.value)}
+            style={{
+              flex: 1,
+              padding: "6px 10px",
+              borderRadius: 6,
+              border: "1px solid #d1d5db",
+              fontSize: 14,
+            }}
+          >
+            <option value="">-- 选择工作流 --</option>
+            {workflows.map((wf) => (
+              <option key={wf.id} value={wf.id}>
+                {wf.name}{wf.description ? ` — ${wf.description}` : ""}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={submitWorkflow}
+            disabled={loading || !selectedWorkflowId}
+            style={{
+              padding: "6px 16px",
+              borderRadius: 6,
+              background: !selectedWorkflowId ? "#9ca3af" : "#8b5cf6",
+              color: "white",
+              border: "none",
+              cursor: !selectedWorkflowId ? "not-allowed" : "pointer",
+              fontSize: 14,
+            }}
+          >
+            {loading ? "运行中..." : "⚙️ 运行"}
+          </button>
+        </div>
+      )}
 
       {error && <div style={{ color: "red" }}>{error}</div>}
 
