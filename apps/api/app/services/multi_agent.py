@@ -12,12 +12,14 @@ Multi-Agent 协作模块。
   → 审查通过 → 输出最终回答
 """
 import json
+import time as _time
 from app.core.config import settings
 from app.services.llm_service import llm_client
 from app.services.rag_service import (
-    build_chat_history,
-    retrieve_relevant_chunks,
+  build_chat_history,
+  retrieve_relevant_chunks,
 )
+from app.services.trace_service import create_trace, finish_trace, record_span
 from app.services.tools import ALL_TOOL_SCHEMAS, TOOL_EXECUTORS
 
 
@@ -25,7 +27,7 @@ from app.services.tools import ALL_TOOL_SCHEMAS, TOOL_EXECUTORS
 # Agent 1: Planner（规划者）
 # ============================================================
 
-def run_planner(question: str, history: list[dict], memory_context: str = "") -> str:
+def run_planner(question: str, history: list[dict], memory_context: str = "", trace_id: str | None = None) -> tuple[str, int]:
   """
   规划 Agent：分析用户需求，输出一个结构化的执行计划。
   
@@ -57,13 +59,31 @@ def run_planner(question: str, history: list[dict], memory_context: str = "") ->
   messages.extend(history[-4:])  # 只用最近 2 轮历史
   messages.append({"role": "user", "content": question})
 
+  start = _time.time()
   response = llm_client.chat.completions.create(
     model=settings.LLM_MODEL,
     temperature=0.3,
     messages=messages,
   )
+  duration = int((_time.time() - start) * 1000)
 
-  return response.choices[0].message.content or ""
+  plan = response.choices[0].message.content or ""
+  tokens = 0
+  if getattr(response, "usage", None):
+    tokens = getattr(response.usage, "total_tokens", 0) or 0
+
+  if trace_id:
+    record_span(
+      trace_id=trace_id,
+      span_type="agent_phase",
+      name="Planner",
+      input_data=question[:2000],
+      output_data=plan[:3000],
+      duration_ms=duration,
+      token_count=tokens,
+    )
+
+  return plan, tokens
 
 # ============================================================
 # Agent 2: Executor（执行者）
@@ -75,6 +95,7 @@ def run_executor(
   user_id: str,
   file_id: str,
   history: list[dict],
+  trace_id: str | None = None,
 ):
   """
   执行 Agent：按照 Planner 的计划，逐步调用工具收集信息。
@@ -110,6 +131,8 @@ def run_executor(
   while iteration < max_iterations:
     iteration += 1
 
+    start = _time.time()
+
     response = llm_client.chat.completions.create(
       model=settings.LLM_MODEL,
       temperature=0.2,
@@ -117,10 +140,26 @@ def run_executor(
       tools=ALL_TOOL_SCHEMAS,
       tool_choice="auto",
     )
+    duration = int((_time.time() - start) * 1000)
+
+    tokens = 0
+    if getattr(response, "usage", None):
+      tokens = getattr(response.usage, "total_tokens", 0) or 0
 
     assistant_message = response.choices[0].message
     content = assistant_message.content or ""
     has_tool_calls = bool(assistant_message.tool_calls)
+
+    if trace_id:
+      record_span(
+        trace_id=trace_id,
+        span_type="llm_call",
+        name=f"Executor/{settings.LLM_MODEL}",
+        input_data=json.dumps(messages[-1], ensure_ascii=False)[:3000],
+        output_data=content[:3000],
+        duration_ms=duration,
+        token_count=tokens,
+      )
 
     if content and has_tool_calls:
       yield {"type": "thought", "content": f"[Executor] {content}"}
@@ -137,6 +176,9 @@ def run_executor(
           "tool_name": tool_name,
           "tool_args": tool_args,
         }
+
+        # 计时开始
+        tool_start = _time.time()
 
         # 执行工具
         if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
@@ -166,6 +208,18 @@ def run_executor(
 
         collected_info.append(f"[{tool_name}] {tool_result[:500]}")
 
+        # 计时结束 + 记录 span
+        tool_duration = int((_time.time() - tool_start) * 1000)
+        if trace_id:
+          record_span(
+            trace_id=trace_id,
+            span_type="tool_call",
+            name=tool_name,
+            input_data=json.dumps(tool_args, ensure_ascii=False),
+            output_data=tool_result[:2000],
+            duration_ms=tool_duration,
+          )
+
         yield {
           "type": "tool_result",
           "tool_name": tool_name,
@@ -187,6 +241,7 @@ def run_executor(
         "type": "executor_done",
         "answer": content,
         "citations": all_citations,
+        "tokens": tokens
       }
       return
 
@@ -204,6 +259,7 @@ def run_executor(
 def run_reviewer(
   question: str,
   executor_answer: str,
+  trace_id: str | None = None,
 ) -> dict:
   """
   审查 Agent：检查 Executor 的回答质量。
@@ -240,6 +296,9 @@ def run_reviewer(
     },
   ]
 
+  # 计时开始
+  llm_start = _time.time()
+
   response = llm_client.chat.completions.create(
     model=settings.LLM_MODEL,
     temperature=0.1,
@@ -247,6 +306,27 @@ def run_reviewer(
   )
 
   raw = response.choices[0].message.content or ""
+
+  # 计时结束
+  llm_duration = int((_time.time() - llm_start) * 1000)
+  
+  # 统计 token
+  tokens = 0
+  if getattr(response, "usage", None):
+    tokens = getattr(response.usage, "total_tokens", 0) or 0
+
+  # 记录 LLM 调用 span
+  if trace_id:
+    record_span(
+      trace_id=trace_id,
+      span_type="agent_phase",
+      name="Reviewer",
+      input_data=question[:2000],
+      output_data=raw[:3000],
+      duration_ms=llm_duration,
+      token_count=tokens,
+    )
+
 
   try:
     # 尝试解析 JSON
@@ -264,6 +344,7 @@ def run_reviewer(
       "approved": result.get("approved", True),
       "feedback": result.get("feedback", ""),
       "improved_answer": result.get("improved_answer", executor_answer),
+      "tokens": tokens,
     }
   except (json.JSONDecodeError, KeyError):
     # JSON 解析失败，默认通过
@@ -271,6 +352,7 @@ def run_reviewer(
       "approved": True,
       "feedback": "",
       "improved_answer": executor_answer,
+      "tokens": tokens,
     }
 
 # ============================================================
@@ -288,6 +370,13 @@ def multi_agent_stream(user_id: str, file_id: str, question: str):
   4. 如果审查不通过，Executor 根据反馈补充执行（最多重试 1 次）
   5. 输出最终回答
   """
+
+  trace_id = create_trace(
+    user_id=user_id, file_id=file_id,
+    question=question, agent_mode="multi-agent",
+  )
+  trace_start = _time.time()
+
   history = build_chat_history(user_id=user_id, file_id=file_id, max_rounds=3)
 
   # 召回长期记忆
@@ -312,18 +401,25 @@ def multi_agent_stream(user_id: str, file_id: str, question: str):
 
   def generate():
     nonlocal all_citations
+    total_tokens = 0
+    span_count = 0
 
     yield {"type": "citations", "citations": []}
+
+    yield {"type": "trace_id", "trace_id": trace_id}
 
     # ── Phase 1: Planner ──
     yield {"type": "thought", "content": "🧠 [Planner] Analyzing request and creating execution plan..."}
 
-    plan = run_planner(
+    plan, planner_tokens = run_planner(
       question=question,
       history=history,
       memory_context=memory_context,
+      trace_id=trace_id,
     )
-
+    total_tokens += planner_tokens
+    span_count += 1
+    
     yield {"type": "thought", "content": f"📋 [Plan]\n{plan}"}
 
     # ── Phase 2: Executor ──
@@ -347,10 +443,13 @@ def multi_agent_stream(user_id: str, file_id: str, question: str):
         user_id=user_id,
         file_id=file_id,
         history=history,
+        trace_id=trace_id,
       ):
         if event["type"] == "executor_done":
           executor_answer = event["answer"]
           all_citations = event.get("citations", [])
+
+          total_tokens += event["tokens"]
 
         elif event["type"] == "citations":
           all_citations = event["citations"]
@@ -365,11 +464,15 @@ def multi_agent_stream(user_id: str, file_id: str, question: str):
       review = run_reviewer(
         question=question,
         executor_answer=executor_answer,
+        trace_id=trace_id
       )
 
       if review["approved"]:
         yield {"type": "thought", "content": "✅ [Reviewer] Answer approved!"}
         final_answer = review["improved_answer"]
+        
+        total_tokens += review["tokens"]
+
         break
 
       else:
@@ -387,6 +490,9 @@ def multi_agent_stream(user_id: str, file_id: str, question: str):
 
     # ── 输出最终回答 ──
     yield {"type": "citations", "citations": all_citations}
+
+    total_duration = int((_time.time() - trace_start) * 1000)
+    finish_trace(trace_id, total_duration, total_tokens, span_count)
 
     chunk_size = 5
     for i in range(0, len(final_answer), chunk_size):

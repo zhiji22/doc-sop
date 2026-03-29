@@ -3,7 +3,15 @@
 封装文件上传和下载操作。MinIO 是自托管的 S3 兼容存储，通过 boto3 客户端访问。
 """
 import boto3
+from botocore.config import Config
 from app.core.config import settings
+
+# boto3 客户端配置：设置连接和读取超时，防止 MinIO 不可用时无限阻塞
+_s3_config = Config(
+    connect_timeout=5,    # 连接超时 5 秒
+    read_timeout=10,      # 读取超时 10 秒
+    retries={"max_attempts": 2},
+)
 
 
 def get_s3_client():
@@ -14,6 +22,7 @@ def get_s3_client():
         aws_access_key_id=settings.STORAGE_ACCESS_KEY,
         aws_secret_access_key=settings.STORAGE_SECRET_KEY,
         region_name=settings.STORAGE_REGION,
+        config=_s3_config,
     )
 
 

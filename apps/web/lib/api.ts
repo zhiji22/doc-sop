@@ -171,6 +171,7 @@ export async function askFileQuestionStream(
     onToolCall?: (toolName: string, toolArgs: Record<string, any>) => void;
     onToolResult?: (toolName: string, resultPreview: string) => void;
     onThought?: (thought: string) => void;
+    onTraceId?: (traceId: string) => void;
   }
 ): Promise<void> {
   const token = await getToken();
@@ -236,6 +237,8 @@ export async function askFileQuestionStream(
         } else if (msg.type === "thought") {
           // 思考推理过程
           callbacks.onThought?.(msg.content);
+        } else if (msg.type === "trace_id") {
+          callbacks.onTraceId?.(msg.trace_id);
         }
       } catch {
         // JSON 解析失败，忽略
@@ -257,6 +260,7 @@ export async function analyzeDocumentStream(
     onToolCall?: (toolName: string, toolArgs: Record<string, any>) => void;
     onToolResult?: (toolName: string, resultPreview: string) => void;
     onThought?: (thought: string) => void;
+    onTraceId?: (traceId: string) => void;
   }
 ): Promise<void> {
   const token = await getToken();
@@ -306,6 +310,7 @@ export async function analyzeDocumentStream(
         else if (msg.type === "tool_call") callbacks.onToolCall?.(msg.tool_name, msg.tool_args);
         else if (msg.type === "tool_result") callbacks.onToolResult?.(msg.tool_name, msg.result_preview);
         else if (msg.type === "thought") callbacks.onThought?.(msg.content);
+        else if (msg.type === "trace_id") callbacks.onTraceId?.(msg.trace_id);
       } catch {}
     }
   }
@@ -324,6 +329,7 @@ export async function multiAgentStream(
     onToolCall?: (toolName: string, toolArgs: Record<string, any>) => void;
     onToolResult?: (toolName: string, resultPreview: string) => void;
     onThought?: (thought: string) => void;
+    onTraceId?: (traceId: string) => void;
   }
 ): Promise<void> {
   const token = await getToken();
@@ -373,6 +379,7 @@ export async function multiAgentStream(
         else if (msg.type === "tool_call") callbacks.onToolCall?.(msg.tool_name, msg.tool_args);
         else if (msg.type === "tool_result") callbacks.onToolResult?.(msg.tool_name, msg.result_preview);
         else if (msg.type === "thought") callbacks.onThought?.(msg.content);
+        else if (msg.type === "trace_id") callbacks.onTraceId?.(msg.trace_id);
       } catch {}
     }
   }

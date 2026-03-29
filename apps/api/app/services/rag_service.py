@@ -345,6 +345,18 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
   - token: 最终回答的文本片段
   - done: 流结束
   """
+  import time as _time
+  from app.services.trace_service import create_trace, finish_trace, record_span
+
+  # 创建 Trace
+  trace_id = create_trace(
+    user_id=user_id, file_id=file_id,
+    question=question, agent_mode="react",
+  )
+  trace_start = _time.time()
+  total_tokens = 0
+  span_count = 0
+
   # 获取历史对话
   history = build_chat_history(user_id=user_id, file_id=file_id, max_rounds=5)
 
@@ -396,12 +408,13 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
   all_citations = []
   
   def generate():
-    nonlocal all_citations
+    nonlocal all_citations, total_tokens, span_count
     
     yield {
       "type": "citations",
       "citations": [],
     }
+    yield {"type": "trace_id", "trace_id": trace_id }
     
     # ReAct 循环
     max_iterations = 8  # 比之前多一些，因为每轮可能有 thought + action 两步
@@ -409,6 +422,9 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
     
     while iteration < max_iterations:
       iteration += 1
+
+      # 计时开始
+      llm_start = _time.time()
       
       # 调用 LLM
       response = llm_client.chat.completions.create(
@@ -418,10 +434,32 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
         tools=ALL_TOOL_SCHEMAS,
         tool_choice="auto",
       )
+
+       # 计时结束
+      llm_duration = int((_time.time() - llm_start) * 1000)
+
+      # 统计 token
+      usage_tokens = 0
+      if getattr(response, "usage", None):
+        usage_tokens = getattr(response.usage, "total_tokens", 0) or 0
+      total_tokens += usage_tokens
+      span_count += 1
       
       assistant_message = response.choices[0].message
       content = assistant_message.content or ""
       has_tool_calls = bool(assistant_message.tool_calls)
+
+      # 记录 LLM 调用 span
+      record_span(
+        trace_id=trace_id,
+        span_type="llm_call",
+        name=settings.LLM_MODEL,
+        input_data=json.dumps(messages[-1], ensure_ascii=False)[:3000],
+        output_data=content[:3000],
+        duration_ms=llm_duration,
+        token_count=usage_tokens,
+        meta={"iteration": iteration, "has_tool_calls": has_tool_calls},
+      )
       
       # ★ ReAct 的核心：LLM 可能同时返回 content（思考）和 tool_calls（行动）
       # 也可能只返回其中一个
@@ -446,6 +484,9 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
             "tool_name": tool_name,
             "tool_args": tool_args,
           }
+
+          # 计时开始
+          tool_start = _time.time()
           
           # 执行工具
           # 需要 user_id/file_id 的工具
@@ -475,6 +516,18 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
           else:
             # 不需要 user_id/file_id 的工具（如 summarize_text）
             tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
+
+          # 计时结束 + 记录 span
+          tool_duration = int((_time.time() - tool_start) * 1000)
+          span_count += 1
+          record_span(
+            trace_id=trace_id,
+            span_type="tool_call",
+            name=tool_name,
+            input_data=json.dumps(tool_args, ensure_ascii=False),
+            output_data=tool_result[:2000],
+            duration_ms=tool_duration,
+          )
           
           # Observation — 工具结果
           yield {
@@ -505,12 +558,20 @@ def answer_with_tools_stream(user_id: str, file_id: str, question: str):
             "type": "token",
             "token": content[i:i + chunk_size],
           }
+
+        # 完成 Trace
+        total_duration = int((_time.time() - trace_start) * 1000)
+        finish_trace(trace_id, total_duration, total_tokens, span_count)
         
         yield {
           "type": "done",
           "answer": content,
         }
         return
+
+    # 完成 Trace
+    total_duration = int((_time.time() - trace_start) * 1000)
+    finish_trace(trace_id, total_duration, total_tokens, span_count)
     
     # 超过最大迭代次数
     yield {
@@ -532,6 +593,18 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
   - system prompt 要求 Agent 先制定分析计划，再逐步执行
   - 适合复杂任务如"完整分析"、"对比章节"、"提取所有要点"
   """
+  import time as _time
+  from app.services.trace_service import create_trace, finish_trace, record_span
+
+  # 创建 Trace
+  trace_id = create_trace(
+    user_id=user_id, file_id=file_id,
+    question=task, agent_mode="analyze",
+  )
+  trace_start = _time.time()
+  total_tokens = 0
+  span_count = 0
+
   history = build_chat_history(user_id=user_id, file_id=file_id, max_rounds=3)
 
   from app.services.memory_service import recall_memories
@@ -575,15 +648,20 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
   all_citations = []
 
   def generate():
-    nonlocal all_citations
+    nonlocal all_citations, total_tokens, span_count
 
     yield {"type": "citations", "citations": []}
+    
+    yield {"type": "trace_id", "trace_id": trace_id}
 
     max_iterations = 12  # 分析任务需要更多轮
     iteration = 0
 
     while iteration < max_iterations:
       iteration += 1
+
+      # 计时开始
+      llm_start = _time.time()
 
       response = llm_client.chat.completions.create(
         model=settings.LLM_MODEL,
@@ -593,9 +671,31 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
         tool_choice="auto",
       )
 
+      # 计时结束
+      llm_duration = int((_time.time() - llm_start) * 1000)
+
+      # 统计 token
+      usage_tokens = 0
+      if getattr(response, "usage", None):
+        usage_tokens = getattr(response.usage, "total_tokens", 0) or 0
+      total_tokens += usage_tokens
+      span_count += 1
+
       assistant_message = response.choices[0].message
       content = assistant_message.content or ""
       has_tool_calls = bool(assistant_message.tool_calls)
+
+      # 记录 LLM 调用 span
+      record_span(
+        trace_id=trace_id,
+        span_type="llm_call",
+        name=settings.LLM_MODEL,
+        input_data=json.dumps(messages[-1], ensure_ascii=False)[:3000],
+        output_data=content[:3000],
+        duration_ms=llm_duration,
+        token_count=usage_tokens,
+        meta={"iteration": iteration, "has_tool_calls": has_tool_calls},
+      )
 
       if content and has_tool_calls:
         yield {"type": "thought", "content": content}
@@ -613,12 +713,16 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
             "tool_args": tool_args,
           }
 
+          # 计时开始
+          tool_start = _time.time()
+
           if tool_name in ("search_document", "get_document_outline", "read_chunk_by_index", "save_memory", "recall_memory"):
               tool_result = TOOL_EXECUTORS[tool_name](
                 user_id=user_id,
                 file_id=file_id,
                 arguments=tool_args,
               )
+
               if tool_name == "search_document":
                 search_chunks = retrieve_relevant_chunks(
                   user_id=user_id,
@@ -636,6 +740,18 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
                     all_citations.append(citation)
           else:
             tool_result = TOOL_EXECUTORS[tool_name](arguments=tool_args)
+
+          # 计时结束 + 记录 span
+          tool_duration = int((_time.time() - tool_start) * 1000)
+          span_count += 1
+          record_span(
+            trace_id=trace_id,
+            span_type="tool_call",
+            name=tool_name,
+            input_data=json.dumps(tool_args, ensure_ascii=False),
+            output_data=tool_result[:2000],
+            duration_ms=tool_duration,
+          )
 
           yield {
             "type": "tool_result",
@@ -657,8 +773,16 @@ def analyze_document_stream(user_id: str, file_id: str, task: str):
         for i in range(0, len(content), chunk_size):
           yield {"type": "token", "token": content[i:i + chunk_size]}
 
+        # 完成 Trace
+        total_duration = int((_time.time() - trace_start) * 1000)
+        finish_trace(trace_id, total_duration, total_tokens, span_count)
+
         yield {"type": "done", "answer": content}
         return
+
+    # 完成 Trace
+    total_duration = int((_time.time() - trace_start) * 1000)
+    finish_trace(trace_id, total_duration, total_tokens, span_count)
 
     yield {"type": "token", "token": "已达到最大分析步数。"}
     yield {"type": "done", "answer": "已达到最大分析步数。"}

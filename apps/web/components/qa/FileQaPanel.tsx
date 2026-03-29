@@ -13,6 +13,8 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  const [traceIds, setTraceIds] = useState<Record<string, string>>({});
+
   async function loadMessages(fileId: string) {
     const data = await fetchQaMessages(getToken, fileId, 50);
     setMessages(data);
@@ -110,6 +112,9 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
             )
           );
         },
+        onTraceId: (traceId) => {
+          setTraceIds((prev) => ({ ...prev, [assistantMsgId]: traceId }));
+        },
         onDone: (_fullAnswer) => {
           // 流结束，可以做一些收尾工作
           // 答案已经通过 onToken 逐字拼好了，不需要额外处理
@@ -198,6 +203,9 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
             )
           );
         },
+        onTraceId: (traceId) => {
+          setTraceIds((prev) => ({ ...prev, [assistantMsgId]: traceId }));
+        },
         onDone: () => {},
         onError: (err) => setError(err),
       });
@@ -277,6 +285,9 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
                 : msg
             )
           );
+        },
+        onTraceId: (traceId) => {
+          setTraceIds((prev) => ({ ...prev, [assistantMsgId]: traceId }));
         },
         onDone: () => {},
         onError: (err) => setError(err),
@@ -377,6 +388,17 @@ export function FileQaPanel({ file }: { file: FileItem | null }) {
                       </div>
                     ))}
                   </div>
+                </div>
+              )}
+              {msg.role === "assistant" && traceIds[msg.id] && (
+                <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>
+                  🔍 Trace: <code style={{
+                    background: "#f3f4f6",
+                    padding: "2px 6px",
+                    borderRadius: 4,
+                  }}>
+                    {traceIds[msg.id].slice(0, 8)}...
+                  </code>
                 </div>
               )}
             </div>
